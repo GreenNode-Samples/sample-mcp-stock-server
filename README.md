@@ -155,6 +155,12 @@ Gateway đặt trong Policy Group (skill `agentbase-policy`). Action có dạng
 
 ## Kiến trúc kỹ thuật
 
+- **Auth /mcp qua shared key** (optional): set `STOCK_API_KEY` → middleware so-sánh
+  constant-time header `X-Stock-Api-Key`. `/health` + `/` luôn mở (health-probe).
+  **Đúng chuẩn platform:** secret nằm trong **AgentBase Identity** (provider
+  `stock-mcp-key`), Gateway connector `stock` đặt `outboundAuth: APIKEY` →
+  gateway gắn key khi forward. Người gọi (agent) chỉ thấy IAM token của mình —
+  key của MCP server không bao giờ lọt ra ngoài.
 - **FastMCP** (`stateless_http=True`) — MCP streamable HTTP tại `/mcp`
 - **TTL cache 60s** — 1 call upstream phục vụ nhiều tool call (có `cache_hits`/`upstream_calls` trong `/health`)
 - **Retry 3 lần** với backoff cho GET idempotent; lỗi sạch → `{"error": ...}` cho agent đọc
@@ -168,6 +174,7 @@ Gateway đặt trong Policy Group (skill `agentbase-policy`). Action có dạng
 | `STOCK_API_BASE_URL` | `https://api-finance-t19.24hmoney.vn` | Ghi đè nguồn (proxy nội bộ) |
 | `HTTP_TIMEOUT_SECONDS` | `10` | Timeout gọi API |
 | `CACHE_TTL_SECONDS` | `60` | TTL cache dữ liệu phiên |
+| `STOCK_API_KEY` | *(trống)* | Nếu set: `/mcp` yêu cầu header `X-Stock-Api-Key` (constant-time compare). Trống = demo mở. Khi nối qua Gateway: connector dùng `outboundAuth` APIKEY — gateway tự gắn key, caller không thấy |
 
 ## Test
 

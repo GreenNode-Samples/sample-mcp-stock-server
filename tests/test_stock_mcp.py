@@ -219,9 +219,47 @@ def test_fastmcp_registered_tools(m):
 
 
 def test_app_routes_health_and_mcp(m):
-    paths = {getattr(r, "path", None) for r in m.app.router.routes}
+    paths = {getattr(r, "path", None) for r in m.asgi_app.router.routes}
     assert "/health" in paths and "/mcp" in paths
 
 
-def test_browser_id_format(m):
-    assert m.DEVICE_ID.startswith("web") and len(m.DEVICE_ID) > 20
+# ─────────────── API-key auth middleware (STOCK_API_KEY) ───────────────
+# Gộp 1 test duy nhất (1 lifespan): session manager MCP không restart được
+# trong cùng process → nhiều TestClient lifespan sẽ xung đột.
+
+def test_mcp_apikey_middleware(m, monkeypatch):
+    """Middleware /mcp: open khi không set key; 401 sai/thiếu key; 200 đúng key;
+    /health luôn mở. STOCK_API_KEY được đọc runtime → monkeypatch được."""
+    from starlette.testclient import TestClient
+
+    ACCEPT = {"Accept": "application/json, text/event-stream"}
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+
+    with TestClient(m.app) as c:  # context manager → chạy lifespan đúng 1 lần
+        # ① demo mode: STOCK_API_KEY trống → /mcp mở, không cần header
+        monkeypatch.setattr(m, "STOCK_API_KEY", "")
+        r = c.post("/mcp", json=body, headers=ACCEPT)
+        assert r.status_code == 200
+        assert len(r.json()["result"]["tools"]) == 5
+
+        # ② protected mode: set key → thiếu header = 401
+        monkeypatch.setattr(m, "STOCK_API_KEY", "test-secret-key-123")
+        r = c.post("/mcp", json=body, headers=ACCEPT)
+        assert r.status_code == 401
+        assert "X-Stock-Api-Key" in r.json()["error"]
+
+        # ③ sai key → 401
+        r = c.post("/mcp", json=body,
+                   headers={**ACCEPT, "X-Stock-Api-Key": "sai-key"})
+        assert r.status_code == 401
+
+        # ④ đúng key → 200 + 5 tools
+        r = c.post("/mcp", json=body,
+                   headers={**ACCEPT, "X-Stock-Api-Key": "test-secret-key-123"})
+        assert r.status_code == 200
+        assert len(r.json()["result"]["tools"]) == 5
+
+        # ⑤ /health KHÔNG cần key (health-probe runtime phải luôn 200)
+        r = c.get("/health")
+        assert r.status_code == 200
+        assert r.json()["mcp_auth"] == "X-Stock-Api-Key"

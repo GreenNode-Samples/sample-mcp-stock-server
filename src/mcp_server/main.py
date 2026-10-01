@@ -19,6 +19,12 @@ Tools (5) — tất cả cắt từ 1 nguồn dữ liệu trên:
 
 Tuỳ biến qua env (tất cả optional): STOCK_API_BASE_URL, HTTP_TIMEOUT_SECONDS,
 CACHE_TTL_SECONDS.
+
+Auth: đặt STOCK_API_KEY để /mcp yêu cầu header X-Stock-Api-Key (hMAC-so-sánh
+constant-time). /health và / vẫn mở (runtime health-probe). Để trống = demo mở.
+Khi nối qua MCP Gateway: đặt connector outboundAuth = APIKEY (provider trong
+AgentBase Identity) — gateway tự gắn key khi forward, người gọi không bao giờ
+nhìn thấy key này.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import asyncio
 import json
 import os
 import random
+import secrets
 import string
 import time
 from datetime import datetime, timezone
@@ -46,6 +53,9 @@ API_BASE = os.environ.get(
 TOP_STOCK_PATH = "/v1/ios/stock-recommend/top-stock-all"
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "10"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL_SECONDS", "60"))  # dữ liệu phiên thay đổi nhanh
+
+# API key bảo vệ /mcp (set = bật; trống = demo mở không cần key)
+STOCK_API_KEY = os.environ.get("STOCK_API_KEY", "").strip()
 
 TZ_VN = ZoneInfo("Asia/Ho_Chi_Minh")
 STALE_AFTER = 15 * 60  # quá 15 phút không cập nhật → có thể đã hết phiên
@@ -346,6 +356,7 @@ async def health(request):
         "server": "vn-stock-mcp",
         "tools": 5,
         "mcp_endpoint": "/mcp",
+        "mcp_auth": "X-Stock-Api-Key" if STOCK_API_KEY else "open (demo mode)",
         "cache": _stats,
     })
 
@@ -364,9 +375,48 @@ async def root(request):
 # streamable_http_app() trả Starlette app (lifespan chạy session manager).
 # MCP streamable HTTP mặc định tại /mcp; append routes phụ trợ vào CHÍNH app này
 # (Mount vào app khác sẽ không chạy lifespan của sub-app).
-app = mcp.streamable_http_app()
-app.router.routes.append(Route("/health", health, methods=["GET"]))
-app.router.routes.append(Route("/", root, methods=["GET"]))
+asgi_app = mcp.streamable_http_app()
+asgi_app.router.routes.append(Route("/health", health, methods=["GET"]))
+asgi_app.router.routes.append(Route("/", root, methods=["GET"]))
+
+
+class _RequireApiKeyMiddleware:
+    """ASGI middleware: /mcp yêu cầu X-Stock-Api-Key khớp STOCK_API_KEY.
+
+    - /health và / không cần key (health-probe của runtime phải luôn 200).
+    - STOCK_API_KEY trống → middleware tắt hoàn toàn (chế độ demo mở).
+    - So sánh constant-time (secrets.compare_digest) chống timing attack.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") == "http"
+            and scope.get("path", "").rstrip("/") == "/mcp"
+            and STOCK_API_KEY
+        ):
+            supplied = ""
+            for k, v in scope.get("headers") or []:
+                if k.decode("latin-1").lower() == "x-stock-api-key":
+                    supplied = v.decode("latin-1")
+                    break
+            if not secrets.compare_digest(supplied, STOCK_API_KEY):
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"application/json")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b'{"error":"missing or invalid X-Stock-Api-Key"}',
+                })
+                return
+        await self.app(scope, receive, send)
+
+
+app = _RequireApiKeyMiddleware(asgi_app)
 
 
 if __name__ == "__main__":
