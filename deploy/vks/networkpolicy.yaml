@@ -1,0 +1,24 @@
+# Tuỳ chọn: chỉ cho phép ingress từ AgentBase VPC (172.30.0.0/16) vào cổng 8080.
+# Cần CNI hỗ trợ NetworkPolicy. Lưu ý: nếu LB/kube-proxy che nguồn (SNAT) thì pod thấy IP
+# của LB/node thay vì 172.30.0.0/16 -> thêm CIDR của subnet LB/node vào `ipBlock` bên dưới.
+# Xác nhận hành vi nguồn IP với GreenNode.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: stock-mcp-allow-agentbase
+  namespace: stock-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app: stock-mcp-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 172.30.0.0/16
+        # - ipBlock:
+        #     cidr: xx.xx.x.x/xx   # subnet của internal LB / node nếu có SNAT
+      ports:
+        - protocol: TCP
+          port: 8080

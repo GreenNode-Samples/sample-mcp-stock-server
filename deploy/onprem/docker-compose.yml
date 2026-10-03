@@ -1,0 +1,29 @@
+# VN Stock MCP Server trong data center on-prem của khách hàng.
+#   cp .env.example .env   # điền MCP_API_KEYS, BIND_ADDR (IP interface nội bộ)
+#   docker compose up -d --build
+# Gateway (Private, 172.30.0.0/16) gọi vào qua VPN/Interconnect — xem README.
+name: stock-mcp
+
+services:
+  mcp:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${MCP_IMAGE:-stock-mcp-server:latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8080"
+    ports:
+      # Chỉ bind vào interface nội bộ (BIND_ADDR), không phải 0.0.0.0.
+      - "${BIND_ADDR:?đặt BIND_ADDR=<IP nội bộ> trong .env}:${MCP_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

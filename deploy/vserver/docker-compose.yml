@@ -1,0 +1,56 @@
+# VN Stock MCP Server trên GreenNode vServer (trong VPC của khách hàng).
+#
+#   cp .env.example .env   # điền MCP_API_KEYS
+#   docker compose up -d --build                  # HTTP :8080 (không TLS)
+#   docker compose --profile tls up -d --build    # thêm Caddy TLS :8443 (xem README)
+#
+# Build context là gốc repo (../..) vì Dockerfile nằm ở đó.
+name: stock-mcp
+
+services:
+  mcp:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    # Dùng image đã push lên vCR: đặt MCP_IMAGE trong .env rồi `docker compose pull`
+    image: ${MCP_IMAGE:-stock-mcp-server:latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8080"
+    ports:
+      # Security group nên chỉ cho 172.30.0.0/16 vào cổng này.
+      # Khi dùng Caddy TLS: BIND_ADDR=127.0.0.1 để cổng này không ra ngoài.
+      - "${BIND_ADDR:-0.0.0.0}:${MCP_PORT:-8080}:8080"
+    healthcheck:
+      # python:3.12-slim không có curl -> dùng python.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Tuỳ chọn: TLS với cert nội bộ. Bật bằng `--profile tls`.
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      mcp:
+        condition: service_healthy
+    environment:
+      CADDY_SITE: ${CADDY_SITE:?đặt CADDY_SITE=<IP private của vServer> trong .env}
+    ports:
+      - "${TLS_PORT:-8443}:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      # Dùng cert của riêng bạn thay cho `tls internal`: bỏ comment và sửa Caddyfile
+      # - ./certs:/certs:ro
+
+volumes:
+  caddy_data:

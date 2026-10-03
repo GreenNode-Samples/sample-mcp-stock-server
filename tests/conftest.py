@@ -18,11 +18,15 @@ def m():
 
 
 @pytest.fixture(autouse=True)
-def clean_cache(m):
+def clean_cache(m, monkeypatch):
     """Cache là state toàn cục — xoá + reset đếm sau mỗi test."""
     m._cache.clear()
     m._stats["upstream_calls"] = 0
     m._stats["cache_hits"] = 0
+    # test không đợi backoff
+    async def _no_sleep(_s):
+        return None
+    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
     yield
     m._cache.clear()
 
@@ -46,6 +50,7 @@ class FakeClient:
     def __init__(self, payload: dict):
         self._payload = payload
         self.calls = 0
+        self.urls: list = []
 
     async def __aenter__(self):
         return self
@@ -55,7 +60,15 @@ class FakeClient:
 
     async def get(self, url, params=None):
         self.calls += 1
-        return FakeResponse(self._payload)
+        self.urls.append((url, dict(params or {})))
+        payload = self._payload
+        if isinstance(payload, dict) and "__routes__" in payload:
+            # route theo path: {"__routes__": {"/v1/...": payload}}
+            for path, body in payload["__routes__"].items():
+                if url.endswith(path):
+                    return FakeResponse(body)
+            return FakeResponse({"status": 404}, status=404)
+        return FakeResponse(payload)
 
 
 def make_api_payload(stocks: list[dict], last_update_ms: int) -> dict:
@@ -107,3 +120,12 @@ SAMPLE_STOCKS = [
 import time as _time
 FRESH_S = int(_time.time())            # epoch giây "vừa cập nhật"
 STALE_S = int(_time.time() - 3600)     # 1 giờ trước → phải có cảnh báo hết phiên
+
+
+def ok(data) -> dict:
+    return {"message": "success", "status": 200, "data": data}
+
+
+def routes(**by_path) -> dict:
+    """Payload nhiều endpoint: routes(**{"/v1/x": ok([...])})."""
+    return {"__routes__": by_path}

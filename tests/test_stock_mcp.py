@@ -214,8 +214,8 @@ def test_fastmcp_registered_tools(m):
 
     tools = asyncio.run(m.mcp.list_tools())
     names = {t.name for t in tools}
-    assert names == {"market_top_stocks", "top_gainers", "top_losers",
-                     "most_active", "stock_quote"}
+    assert names == set(m.TOOL_NAMES)
+    assert len(names) == 13
 
 
 def test_app_routes_health_and_mcp(m):
@@ -223,43 +223,247 @@ def test_app_routes_health_and_mcp(m):
     assert "/health" in paths and "/mcp" in paths
 
 
-# ─────────────── API-key auth middleware (STOCK_API_KEY) ───────────────
+# ─────────────── Tools mới: doanh nghiệp / lịch sử ───────────────
+
+from conftest import ok, routes  # noqa: E402
+
+COMPANIES = [
+    {"symbol": "HPG", "company_name": "Công ty Cổ phần Tập đoàn Hòa Phát", "floor": "HOSE",
+     "short_name": "Hòa Phát", "company_name_eng": "Hoa Phat Group", "extra_name": "HPG, hoa phat",
+     "description": "Tập đoàn sản xuất thép hàng đầu Việt Nam."},
+    {"symbol": "HPX", "company_name": "Công ty Cổ phần Đầu tư Hải Phát", "floor": "HOSE"},
+    {"symbol": "FPT", "company_name": "Công ty Cổ phần FPT", "floor": "HOSE",
+     "company_name_eng": "FPT Corporation", "description": "x" * 2000},
+    {"symbol": "PHP", "company_name": "Cảng Hải Phòng", "floor": "HNX"},
+]
+
+
+@pytest.mark.asyncio
+async def test_search_company_accent_insensitive(m):
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(COMPANIES))
+        data = parse(await m.search_company("hoa phat"))
+    assert data["results"][0]["symbol"] == "HPG"
+
+
+@pytest.mark.asyncio
+async def test_search_company_symbol_ranked_first(m):
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(COMPANIES))
+        data = parse(await m.search_company("hp"))
+    # mã bắt đầu bằng 'hp' xếp trước mã chỉ khớp theo tên
+    assert [r["symbol"] for r in data["results"]][:2] == ["HPG", "HPX"]
+
+
+@pytest.mark.asyncio
+async def test_search_company_priority_breaks_ties(m):
+    """Cùng điểm khớp + cùng sàn: doanh nghiệp priority=1 (large-cap) xếp trước mã nhỏ."""
+    companies = [
+        {"symbol": "HPA", "company_name": "Công ty Cổ phần Nông nghiệp Quốc tế Hoàng Phát Hòa Phát",
+         "floor": "HOSE", "priority": 0},
+        {"symbol": "HPG", "company_name": "Công ty Cổ phần Tập đoàn Hòa Phát",
+         "floor": "HOSE", "priority": 1},
+        {"symbol": "HPX", "company_name": "Công ty Cổ phần Hòa Phát Xanh", "floor": "UPCOM", "priority": 0},
+    ]
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(companies))
+        data = parse(await m.search_company("hoa phat"))
+    assert [r["symbol"] for r in data["results"]] == ["HPG", "HPA", "HPX"]
+    # điểm khớp vẫn ưu tiên hơn priority: mã khớp chính xác luôn đứng đầu
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(companies))
+        data = parse(await m.search_company("hpa"))
+    assert data["results"][0]["symbol"] == "HPA"
+
+
+@pytest.mark.asyncio
+async def test_search_company_short_query(m):
+    data = parse(await m.search_company("h"))
+    assert "error" in data
+
+
+@pytest.mark.asyncio
+async def test_company_profile_truncates_description(m):
+    with pytest.MonkeyPatch.context() as mp:
+        fake = patch_api(m, mp, ok(COMPANIES))
+        data = parse(await m.company_profile("fpt"))
+        again = parse(await m.company_profile("HPG"))
+    assert data["exchange"] == "HOSE" and data["description"].endswith("…")
+    assert again["company_name_eng"] == "Hoa Phat Group"
+    assert fake.calls == 1  # danh bạ công ty được cache
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["", "F", "FPT;DROP", "../x", None])
+async def test_symbol_validation(m, bad):
+    for tool in (m.company_profile, m.price_history, m.foreign_trading, m.valuation,
+                 m.dividend_history, m.business_plan, m.company_announcements):
+        data = parse(await tool(bad))
+        assert "không hợp lệ" in data["error"]
+
+
+HISTORY = [  # API trả không theo thứ tự → server phải sort mới nhất trước
+    {"trading_date": 1790755803, "match_price": 63.0, "basic_price": 62.0,
+     "accumulated_vol": 2_000_000, "accumulated_val": 126.0},
+    {"trading_date": 1790928601, "match_price": 62.1, "basic_price": 62.7,
+     "accumulated_vol": 3_199_600, "accumulated_val": 200.3},
+    {"trading_date": 1790842201, "match_price": 62.7, "basic_price": 63.0,
+     "accumulated_vol": 1_500_000, "accumulated_val": 94.0},
+]
+
+
+@pytest.mark.asyncio
+async def test_price_history_sorted_and_summary(m):
+    with pytest.MonkeyPatch.context() as mp:
+        fake = patch_api(m, mp, ok(HISTORY))
+        data = parse(await m.price_history("fpt", days=3))
+    s = data["sessions"]
+    assert [r["close"] for r in s] == [62.1, 62.7, 63.0]
+    assert s[0]["change"] == -0.6 and s[0]["change_percent"] == -0.96
+    assert data["summary"]["high"] == 63.0 and data["summary"]["low"] == 62.1
+    # kỳ: từ tham chiếu phiên cũ nhất (62.0) tới đóng cửa mới nhất (62.1)
+    assert data["summary"]["period_change_percent"] == 0.16
+    assert fake.urls[0][1]["symbol"] == "FPT"
+
+
+@pytest.mark.asyncio
+async def test_price_history_days_clamped(m):
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(HISTORY))
+        data = parse(await m.price_history("FPT", days=1))
+    assert data["summary"]["sessions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_foreign_trading_net(m):
+    rows = [{"trading_date": 1790928601, "match_price": 62.1, "buy_foreign_qtty": 474146,
+             "sell_foreign_qtty": 522297, "buy_foreign_val": 29.6825, "sell_foreign_val": 32.69685},
+            {"trading_date": 1790842201, "match_price": 62.7, "buy_foreign_qtty": 900000,
+             "sell_foreign_qtty": 100000, "buy_foreign_val": 56.4, "sell_foreign_val": 6.3}]
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(rows))
+        data = parse(await m.foreign_trading("FPT"))
+    assert data["sessions"][0]["net_value_bn_vnd"] == -3.014
+    assert data["summary"]["trend"] == "mua ròng"
+
+
+@pytest.mark.asyncio
+async def test_valuation_metrics(m):
+    payload = {"pe": {"value": 11.6611, "message": "Rẻ hơn TB ngành", "group_value": 11.98},
+               "roe": {"value": 26.4747, "message": "Giảm 2 quý liên tiếp"},
+               "roa": {"value": None}, "group_name": "Công nghệ Thông tin"}
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(payload))
+        data = parse(await m.valuation("FPT"))
+    assert data["industry"] == "Công nghệ Thông tin"
+    assert data["metrics"]["pe"] == {"label": "P/E", "value": 11.66, "industry_avg": 11.98,
+                                     "note": "Rẻ hơn TB ngành"}
+    assert "roa" not in data["metrics"]
+
+
+@pytest.mark.asyncio
+async def test_valuation_empty(m):
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok({}))
+        data = parse(await m.valuation("XYZQ"))
+    assert "error" in data
+
+
+@pytest.mark.asyncio
+async def test_dividend_history_types(m):
+    rows = [{"type": 2, "end_date": "2023-07-05", "ratio": 0.15},
+            {"type": 1, "end_date": "2026-05-28", "ratio": 0.1},
+            {"type": 3, "end_date": "2026-09-22", "ratio": 0.1}]
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(rows))
+        data = parse(await m.dividend_history("FPT"))
+    d = data["dividends"]
+    assert [x["date"] for x in d] == ["2026-09-22", "2026-05-28", "2023-07-05"]
+    assert d[1]["type"] == "tiền mặt" and d[1]["cash_vnd_per_share"] == 1000
+    assert d[2]["type"] == "cổ phiếu" and d[2]["ratio_percent"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_business_plan(m):
+    payload = {"year": 2026, "quarter": 2, "plan": [
+        {"expect": 58580.0, "current": 26268.5, "percent": 44.84, "label": "Doanh thu"}]}
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(payload))
+        data = parse(await m.business_plan("FPT"))
+    assert data["plan"][0] == {"item": "Doanh thu", "target": 58580.0,
+                               "actual": 26268.5, "completed_percent": 44.84}
+
+
+@pytest.mark.asyncio
+async def test_company_announcements_limit(m):
+    rows = [{"title": f"Tin {i}", "published_date": 1790580541, "link": [f"https://x/{i}.pdf"]}
+            for i in range(10)]
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, ok(rows))
+        data = parse(await m.company_announcements("FPT", limit=3))
+    assert data["count"] == 3
+    assert data["announcements"][0] == {"date": "2026-09-28", "title": "Tin 0", "url": "https://x/0.pdf"}
+
+
+@pytest.mark.asyncio
+async def test_routes_fake_dispatch(m):
+    """Nhiều endpoint trong 1 test: mỗi tool gọi đúng path của nó."""
+    with pytest.MonkeyPatch.context() as mp:
+        patch_api(m, mp, routes(**{m.PLAN_PATH: ok({"year": 2026, "quarter": 1, "plan": [
+            {"label": "LNST", "expect": 10, "current": 5, "percent": 50}]}),
+            m.DIVIDEND_PATH: ok([{"type": 1, "end_date": "2026-01-01", "ratio": 0.2}])}))
+        plan = parse(await m.business_plan("VNM"))
+        div = parse(await m.dividend_history("VNM"))
+    assert plan["plan"][0]["completed_percent"] == 50
+    assert div["dividends"][0]["cash_vnd_per_share"] == 2000
+
+
+# ─────────────── Auth fail-closed (MCP_API_KEYS) ───────────────
 # Gộp 1 test duy nhất (1 lifespan): session manager MCP không restart được
 # trong cùng process → nhiều TestClient lifespan sẽ xung đột.
 
-def test_mcp_apikey_middleware(m, monkeypatch):
-    """Middleware /mcp: open khi không set key; 401 sai/thiếu key; 200 đúng key;
-    /health luôn mở. STOCK_API_KEY được đọc runtime → monkeypatch được."""
+def test_mcp_auth_fail_closed(m, monkeypatch):
     from starlette.testclient import TestClient
 
     ACCEPT = {"Accept": "application/json, text/event-stream"}
     body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    KEY_A, KEY_B = "a" * 32, "b" * 32
 
     with TestClient(m.app) as c:  # context manager → chạy lifespan đúng 1 lần
-        # ① demo mode: STOCK_API_KEY trống → /mcp mở, không cần header
-        monkeypatch.setattr(m, "STOCK_API_KEY", "")
+        # ① không cấu hình key → 503, KHÔNG tự mở
+        monkeypatch.setattr(m, "API_KEYS", [])
+        monkeypatch.setattr(m, "ALLOW_ANONYMOUS", False)
         r = c.post("/mcp", json=body, headers=ACCEPT)
-        assert r.status_code == 200
-        assert len(r.json()["result"]["tools"]) == 5
+        assert r.status_code == 503
+        assert c.get("/health").json()["mcp_auth"].startswith("locked")
 
-        # ② protected mode: set key → thiếu header = 401
-        monkeypatch.setattr(m, "STOCK_API_KEY", "test-secret-key-123")
+        # ② ALLOW_ANONYMOUS (local dev) → mở
+        monkeypatch.setattr(m, "ALLOW_ANONYMOUS", True)
         r = c.post("/mcp", json=body, headers=ACCEPT)
+        assert r.status_code == 200 and len(r.json()["result"]["tools"]) == 13
+
+        # ③ có key → key luôn bắt buộc, kể cả khi ALLOW_ANONYMOUS
+        monkeypatch.setattr(m, "API_KEYS", [KEY_A, KEY_B])
+        r = c.post("/mcp", json=body, headers=ACCEPT)
+        assert r.status_code == 401 and "www-authenticate" in r.headers
+        r = c.post("/mcp", json=body, headers={**ACCEPT, "X-Api-Key": "sai"})
         assert r.status_code == 401
-        assert "X-Stock-Api-Key" in r.json()["error"]
 
-        # ③ sai key → 401
-        r = c.post("/mcp", json=body,
-                   headers={**ACCEPT, "X-Stock-Api-Key": "sai-key"})
-        assert r.status_code == 401
+        # ④ 3 kiểu header hợp lệ + xoay vòng 2 key
+        for hdr in ({"X-Api-Key": KEY_A}, {"Authorization": f"Bearer {KEY_B}"},
+                    {"X-Stock-Api-Key": KEY_A}):
+            r = c.post("/mcp", json=body, headers={**ACCEPT, **hdr})
+            assert r.status_code == 200, hdr
 
-        # ④ đúng key → 200 + 5 tools
-        r = c.post("/mcp", json=body,
-                   headers={**ACCEPT, "X-Stock-Api-Key": "test-secret-key-123"})
-        assert r.status_code == 200
-        assert len(r.json()["result"]["tools"]) == 5
+        # ⑤ /health và / không cần key
+        assert c.get("/health").status_code == 200
+        assert c.get("/").status_code == 200
+        assert c.get("/health").json()["mcp_auth"] == "api-key (2 key)"
 
-        # ⑤ /health KHÔNG cần key (health-probe runtime phải luôn 200)
-        r = c.get("/health")
-        assert r.status_code == 200
-        assert r.json()["mcp_auth"] == "X-Stock-Api-Key"
+
+def test_load_api_keys_env(m, monkeypatch):
+    monkeypatch.setenv("MCP_API_KEYS", " k1 , ,k2 ")
+    assert m._load_api_keys() == ["k1", "k2"]
+    monkeypatch.delenv("MCP_API_KEYS")
+    monkeypatch.setenv("STOCK_API_KEY", "legacy")
+    assert m._load_api_keys() == ["legacy"]
