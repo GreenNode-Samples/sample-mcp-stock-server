@@ -8,7 +8,7 @@
 > Cùng một image có thể chạy ở **3 nơi** — Agent Runtime, vServer/VKS trong VPC khách hàng,
 > hoặc on-prem: xem [Triển khai ở 3 nơi](#triển-khai-ở-3-nơi).
 
-[![CI](https://github.com/GreenNode-Sample-AgentBase/greennode-agentbase-mcp-stock-server/actions/workflows/ci.yml/badge.svg)](https://github.com/GreenNode-Sample-AgentBase/greennode-agentbase-mcp-stock-server/actions/workflows/ci.yml)
+[![CI](https://github.com/GreenNode-Samples/greennode-agentbase-sample-mcp-stock-server/actions/workflows/ci.yml/badge.svg)](https://github.com/GreenNode-Samples/greennode-agentbase-sample-mcp-stock-server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Vì sao repo này tồn tại?
@@ -361,8 +361,8 @@ và middleware auth fail-closed (503 / 401 / 3 kiểu header / xoay vòng 2 key)
 - Skill `agentbase-identity` — Access Control: lưu API key provider
 - Skill `agentbase-gateway` — MCP Connector, inbound/outbound auth, gắn Policy Group
 - Skill `agentbase-policy` — viết policy `stock__<tool>`
-- Hai sample agent dùng chung hạ tầng: `greennode-agentbase-travel-buddy`,
-  `greennode-agentbase-zalo-restaurant`
+- Hai sample agent dùng chung hạ tầng: `greennode-agentbase-sample-travel-buddy`,
+  `greennode-agentbase-sample-zalo-restaurant`
 
 ## License
 
