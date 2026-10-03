@@ -33,7 +33,7 @@ Agent → MCP Gateway (Private, AgentBase VPC 172.30.0.0/16)
 ## 2. Chạy container
 
 ```bash
-git clone <repo> && cd greennode-agentbase-sample-mcp-stock-server/deploy/vserver
+git clone <repo> && cd sample-mcp-stock-server/deploy/vserver
 cp .env.example .env && chmod 600 .env
 # sửa .env: MCP_API_KEYS=$(openssl rand -hex 32)  — GHI LẠI, dùng lại ở Access Control
 
