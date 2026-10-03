@@ -11,6 +11,12 @@
 [![CI](https://github.com/GreenNode-Samples/sample-mcp-stock-server/actions/workflows/ci.yml/badge.svg)](https://github.com/GreenNode-Samples/sample-mcp-stock-server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+## 🏗 Kiến trúc
+
+![Kiến trúc mcp-stock-server](docs/architecture.svg)
+
+Agent gọi tool qua **MCP Gateway** → Policy Group → connector `stock` gắn **API key** lấy từ **Access Control** → server kiểm tra key (fail-closed) → gọi API 24hMoney. Cùng image chạy được trên Agent Runtime, vServer / VKS trong VPC của KH, hoặc on-premise — xem [Triển khai ở 3 nơi](#triển-khai-ở-3-nơi).
+
 ## Vì sao repo này tồn tại?
 
 Hạ tầng GreenNode AgentBase không chỉ chạy *agent* — **Agent Runtime** chạy được
