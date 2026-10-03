@@ -1,89 +1,89 @@
-# Chạy MCP server trên GreenNode vServer (trong VPC khách hàng)
+# Run the MCP server on GreenNode vServer (inside the customer VPC)
 
-Dùng khi MCP server phải nằm **trong VPC của khách hàng** (không mở ra Internet) và
-được **MCP Gateway chế độ Private** gọi vào qua kết nối private tới AgentBase.
-Cùng một image với bản Agent Runtime — chỉ khác nơi chạy.
+Use this when the MCP server must sit **inside the customer's VPC** (not exposed to the Internet) and be
+called by a **Private-mode MCP Gateway** over a private connection to AgentBase.
+It uses the same image as the Agent Runtime variant — only the place it runs differs.
 
 ```
 Agent → MCP Gateway (Private, AgentBase VPC 172.30.0.0/16)
-      → kết nối private → VPC khách hàng → vServer (subnet private)
+      → private connection → customer VPC → vServer (private subnet)
       → [Caddy :8443 TLS] → stock-mcp :8080 → 24hMoney
 ```
 
-## 1. Chuẩn bị mạng
+## 1. Prepare the network
 
-1. Tạo **vServer** (Ubuntu/Debian có Docker + Docker Compose plugin) trong **subnet private**
-   của VPC khách hàng. Không cần Floating/Public IP cho inbound.
-2. VPC đó phải **đã được kết nối private với AgentBase** (chỉ những VPC này mới hiện khi tạo
-   Private gateway). Chưa có → liên hệ GreenNode support để kích hoạt.
-3. **Security group** của vServer — inbound:
+1. Create a **vServer** (Ubuntu/Debian with Docker + the Docker Compose plugin) in a **private subnet**
+   of the customer VPC. No Floating/Public IP is needed for inbound traffic.
+2. The VPC must be **already privately connected to AgentBase** (only such VPCs appear when creating a
+   Private gateway). If it is not, contact GreenNode support to enable it.
+3. The vServer's **security group** — inbound:
 
-   | Giao thức | Cổng | Nguồn | Ghi chú |
+   | Protocol | Port | Source | Notes |
    |---|---|---|---|
-   | TCP | `8080` (hoặc `8443` nếu dùng TLS) | `172.30.0.0/16` | Dải của AgentBase VPC (MCP Gateway) / private connection |
-   | TCP | `22` | `xx.xx.x.x/xx` | SSH từ dải quản trị của bạn |
+   | TCP | `8080` (or `8443` if using TLS) | `172.30.0.0/16` | AgentBase VPC range (MCP Gateway) / private connection |
+   | TCP | `22` | `xx.xx.x.x/xx` | SSH from your administration range |
 
-   Không mở `8080` cho `0.0.0.0/0`. Outbound cần ra được `api-finance-t19.24hmoney.vn:443`
-   (qua NAT Gateway của VPC) — hoặc đặt `STOCK_API_BASE_URL` trỏ tới proxy/mirror nội bộ.
-4. VPC phải bật **DNS resolution** (yêu cầu của Private gateway).
+   Do not open `8080` to `0.0.0.0/0`. Outbound must be able to reach `api-finance-t19.24hmoney.vn:443`
+   (via the VPC's NAT Gateway) — or set `STOCK_API_BASE_URL` to point to an internal proxy/mirror.
+4. The VPC must have **DNS resolution** enabled (a Private gateway requirement).
 
-> Nếu nguồn của request tới vServer có bị NAT hay không (có thể không phải `172.30.0.0/16`)
-> → xác nhận với GreenNode, rồi chỉnh security group cho khớp.
+> Confirm with GreenNode whether the request source reaching the vServer is NATed (it may not be
+> `172.30.0.0/16`), then adjust the security group accordingly.
 
-## 2. Chạy container
+## 2. Run the container
 
 ```bash
 git clone <repo> && cd sample-mcp-stock-server/deploy/vserver
 cp .env.example .env && chmod 600 .env
-# sửa .env: MCP_API_KEYS=$(openssl rand -hex 32)  — GHI LẠI, dùng lại ở Access Control
+# edit .env: MCP_API_KEYS=$(openssl rand -hex 32)  — RECORD IT, reuse it in Access Control
 
-docker compose up -d --build        # build từ Dockerfile của repo
-# hoặc dùng image trên vCR: đặt MCP_IMAGE=vcr.vngcloud.vn/<repo>/stock-mcp-server:v1 trong .env
+docker compose up -d --build        # build from the repo's Dockerfile
+# or use the image on vCR: set MCP_IMAGE=vcr.vngcloud.vn/<repo>/stock-mcp-server:v1 in .env
 #   docker login vcr.vngcloud.vn && docker compose pull && docker compose up -d
 
-docker compose ps                   # STATUS phải là "healthy"
+docker compose ps                   # STATUS must be "healthy"
 curl -s http://localhost:8080/health
 ```
 
-Compose đã có `restart: unless-stopped` và healthcheck `GET /health`
-(image slim không có `curl` nên healthcheck dùng `python`).
+Compose already sets `restart: unless-stopped` and a `GET /health` healthcheck
+(the slim image has no `curl`, so the healthcheck uses `python`).
 
-## 3. TLS (khuyến nghị)
+## 3. TLS (recommended)
 
-Connector URL mẫu trong tài liệu là `https://xx.xx.x.x:8443/mcp`. Nếu endpoint của connector
-yêu cầu HTTPS, chạy Caddy phía trước:
+The sample connector URL in the documentation is `https://xx.xx.x.x:8443/mcp`. If the connector's endpoint
+requires HTTPS, run Caddy in front:
 
 ```bash
 # .env
-BIND_ADDR=127.0.0.1          # chỉ Caddy ra ngoài
-CADDY_SITE=xx.xx.x.x         # IP private của vServer (hoặc hostname nội bộ)
+BIND_ADDR=127.0.0.1          # only Caddy is exposed externally
+CADDY_SITE=xx.xx.x.x         # the vServer's private IP (or an internal hostname)
 TLS_PORT=8443
 
 docker compose --profile tls up -d --build
 curl -ks https://xx.xx.x.x:8443/health
 ```
 
-`Caddyfile` mặc định dùng `tls internal` (CA nội bộ của Caddy). Gateway cần **tin** CA đó —
-xác nhận với GreenNode cách dùng CA/cert tuỳ chỉnh cho connector. Cách chắc hơn: dùng cert do
-CA doanh nghiệp (mà gateway tin) cấp, mount vào `./certs` và bật dòng `tls /certs/server.crt /certs/server.key`.
-Nếu thích nginx: `proxy_pass http://127.0.0.1:8080;` với `proxy_buffering off;` và `listen 8443 ssl;`.
+The default `Caddyfile` uses `tls internal` (Caddy's internal CA). The gateway must **trust** that CA —
+confirm with GreenNode how to use a custom CA/certificate for the connector. A more reliable approach: use a certificate issued by
+an enterprise CA (one the gateway trusts), mount it into `./certs`, and enable the line `tls /certs/server.crt /certs/server.key`.
+If you prefer nginx: use `proxy_pass http://127.0.0.1:8080;` with `proxy_buffering off;` and `listen 8443 ssl;`.
 
-Nhớ mở security group cho cổng `8443` thay vì `8080`.
+Remember to open the security group for port `8443` instead of `8080`.
 
-## 4. Nối vào MCP Gateway
+## 4. Connect to MCP Gateway
 
-1. **Gateway**: tạo gateway với Network mode **Private** (chọn VPC + Subnet của vServer; **không đổi
-   được sau khi tạo**).
-2. **Access Control**: tạo API Key provider (vd `stock-mcp-key`) với đúng giá trị `MCP_API_KEYS`.
-3. **Connector**: Endpoint `https://xx.xx.x.x:8443/mcp` (hoặc `http://xx.xx.x.x:8080/mcp` nếu không TLS),
+1. **Gateway**: create a gateway with Network mode **Private** (select the VPC + Subnet of the vServer; **cannot be
+   changed after creation**).
+2. **Access Control**: create an API Key provider (e.g. `stock-mcp-key`) with exactly the value of `MCP_API_KEYS`.
+3. **Connector**: Endpoint `https://xx.xx.x.x:8443/mcp` (or `http://xx.xx.x.x:8080/mcp` without TLS),
    Outbound Auth = **API Key**, header `X-Api-Key`, provider `stock-mcp-key`.
-4. **Policy Group**: giữ nguyên action `stock__<tool>` như ở README gốc.
+4. **Policy Group**: keep the `stock__<tool>` actions exactly as in the main README.
 
-Kiểm tra nhanh từ một host khác trong VPC: `../onprem/check_connectivity.sh` (cũng dùng được cho vServer).
+Quick check from another host in the VPC: `../onprem/check_connectivity.sh` (it also works for vServer).
 
-## Cập nhật / xoay key
+## Updates / key rotation
 
 ```bash
-docker compose up -d --build            # sau khi pull code mới
-# xoay key: MCP_API_KEYS="key_cu,key_moi" → docker compose up -d → đổi key ở Access Control → bỏ key_cu
+docker compose up -d --build            # after pulling new code
+# rotate key: MCP_API_KEYS="old_key,new_key" → docker compose up -d → change the key in Access Control → remove old_key
 ```
