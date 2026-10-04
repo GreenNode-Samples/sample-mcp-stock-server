@@ -1,5 +1,12 @@
-# Service để MCP Gateway (Private) gọi vào từ AgentBase VPC.
-# Cần một load balancer NỘI BỘ (internal) trong VPC của khách hàng — không public ra Internet.
+# Service that exposes the MCP server to the MCP Gateway (Private mode, AgentBase VPC 172.30.0.0/16).
+#
+# NodePort keeps the server on the private network: it is reachable at <node private IP>:30080 and
+# nothing is published to the Internet by this manifest. Restrict port 30080 on the worker nodes'
+# security group to 172.30.0.0/16 (and do not give the nodes public IPs).
+#
+# Do NOT switch this to `type: LoadBalancer` without an internal-load-balancer annotation taken from
+# the GreenNode vLB / VKS documentation: without it the cloud may create a PUBLIC load balancer.
+# This sample does not ship such an annotation because it has not been verified.
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,31 +14,13 @@ metadata:
   namespace: stock-mcp
   labels:
     app: stock-mcp-server
-  # TODO: thêm annotation internal LB theo docs vLB/VKS của GreenNode
-  # (annotation để tạo load balancer nội bộ / chọn subnet — KHÔNG tự đoán tên annotation).
-  # annotations:
-  #   <annotation-internal-lb>: "<giá-trị>"
 spec:
-  type: LoadBalancer
+  type: NodePort
   selector:
     app: stock-mcp-server
   ports:
     - name: http
-      port: 8080          # nếu đặt TLS ở LB/ingress: đổi thành 8443 và terminate TLS ở đó
+      port: 8080
       targetPort: http
+      nodePort: 30080   # default NodePort range: 30000-32767
       protocol: TCP
-
-# ---------------------------------------------------------------------------
-# Phương án thay thế: NodePort (dùng khi chưa có internal LB).
-# Thay `type: LoadBalancer` ở trên bằng type: NodePort + nodePort, rồi trỏ connector tới
-# IP private của node: http://<node-ip>:30080/mcp. Security group của node worker
-# phải cho 172.30.0.0/16 vào cổng 30080.
-#
-#   spec:
-#     type: NodePort
-#     ports:
-#       - name: http
-#         port: 8080
-#         targetPort: http
-#         nodePort: 30080   # dải mặc định 30000-32767
-# ---------------------------------------------------------------------------

@@ -23,8 +23,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: mcp
-          # Image đã push lên vCR (xem README: docker build/push). Nếu repo vCR là private,
-          # tạo imagePullSecret và bỏ comment imagePullSecrets bên dưới.
+          # Image pushed to vCR (see the README: docker build / push). If the vCR repository is private,
+          # create an imagePullSecret and uncomment imagePullSecrets below.
           image: vcr.vngcloud.vn/<repo>/stock-mcp-server:v1
           imagePullPolicy: IfNotPresent
           ports:
@@ -35,7 +35,7 @@ spec:
               value: "8080"
           envFrom:
             - secretRef:
-                name: stock-mcp-secret   # chứa MCP_API_KEYS
+                name: stock-mcp-secret   # holds MCP_API_KEYS
           resources:
             requests:
               cpu: 100m
@@ -62,7 +62,7 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-            # Server chỉ ghi vào bộ nhớ (cache), không ghi đĩa.
+            # The server only writes to memory (cache), never to disk.
             readOnlyRootFilesystem: true
       # imagePullSecrets:
       #   - name: vcr-pull-secret

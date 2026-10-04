@@ -1,7 +1,7 @@
-# Tuỳ chọn: chỉ cho phép ingress từ AgentBase VPC (172.30.0.0/16) vào cổng 8080.
-# Cần CNI hỗ trợ NetworkPolicy. Lưu ý: nếu LB/kube-proxy che nguồn (SNAT) thì pod thấy IP
-# của LB/node thay vì 172.30.0.0/16 -> thêm CIDR của subnet LB/node vào `ipBlock` bên dưới.
-# Xác nhận hành vi nguồn IP với GreenNode.
+# Optional: only admit ingress to port 8080 from the AgentBase VPC (172.30.0.0/16).
+# Needs a CNI that enforces NetworkPolicy. Note: if the load balancer / kube-proxy hides the source
+# address (SNAT), the pod sees the LB / node IP instead of 172.30.0.0/16 -> add the CIDR of the
+# LB / node subnet as another `ipBlock` below. Confirm the source-IP behaviour with GreenNode.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -18,7 +18,7 @@ spec:
         - ipBlock:
             cidr: 172.30.0.0/16
         # - ipBlock:
-        #     cidr: xx.xx.x.x/xx   # subnet của internal LB / node nếu có SNAT
+        #     cidr: xx.xx.x.x/xx   # subnet of the node / internal LB if SNAT applies
       ports:
         - protocol: TCP
           port: 8080
