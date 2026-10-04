@@ -61,7 +61,17 @@ GreenNode AgentBase infrastructure does not only run *agents*. **Agent Runtime**
 
 ## Tools (13)
 
-Every tool returns JSON (as a string). Errors are returned as `{"error": "..."}` so the agent can read them; no exception is raised.
+Every tool returns a JSON **object** (MCP structured output: `structuredContent`, with the same JSON as text in `content`).
+A failure is a normal MCP tool error: the result has `isError: true` and a short, readable message in `content` (for
+example `Invalid stock symbol: 'x'...` or `24hMoney API is unavailable (HTTP 503) after 3 attempts`). Error messages never
+contain the upstream URL. All tools are annotated `readOnlyHint` and `openWorldHint`.
+
+Common result conventions:
+
+- `source` (`"24hmoney.vn"`) is at the top level of every result; `units` is at the top level of every result that contains numbers.
+- Every list result has a `count`. Missing upstream values are `null`, never `0`.
+- Dates are `YYYY-MM-DD` (trading days in Vietnam time); timestamps are ISO 8601 with the `+07:00` offset.
+- Limits (`limit`, `days`) are clamped to the documented range instead of being rejected.
 
 ### Market
 
@@ -75,8 +85,8 @@ Shared source `top-stock-all` (~90 most liquid symbols), cached for 60s.
 | `most_active(limit)` | Top symbols by **liquidity** (traded value) |
 | `stock_quote(symbol)` | Quote for one symbol in the top group: price, +/-%, ceiling/floor, matched volume & value, foreign buy/sell |
 
-Results include `meta`: source, number of tracked symbols, `last_update` (Vietnam time), and a warning if
-the data is more than 15 minutes old (market closed).
+Market results also include `stocks_tracked`, `last_update` (ISO 8601, Vietnam time) and a `note` when the data is
+more than 15 minutes old (market closed). `state` is one of `up`, `down`, `unchanged`, `at_ceiling`, `at_floor`, `unknown`.
 
 ### Companies
 
@@ -84,14 +94,14 @@ Applies to every symbol listed on HOSE · HNX · UPCOM (~1.6k companies). `symbo
 
 | Tool | Description |
 |---|---|
-| `search_company(query, limit)` | Find a symbol by name / ticker, accent- and case-insensitive. Ranking: ticker match → name match, then larger companies first (`priority`), exchange order HOSE > HNX > UPCOM |
+| `search_company(query, limit)` | Find a symbol by name / ticker (`limit` 1–30, default 10), accent- and case-insensitive. Ranking: ticker match → name match, then larger companies first (`priority`), exchange order HOSE > HNX > UPCOM |
 | `company_profile(symbol)` | Full name (VN/EN), listing exchange, business description |
-| `price_history(symbol, days)` | Daily closing price, volume, value (≤ 30 sessions) |
-| `foreign_trading(symbol, days)` | Daily foreign buy/sell (≤ 25 sessions) |
+| `price_history(symbol, days)` | Per trading session (newest first): close, reference, +/-%, volume, value. `days` = number of trading sessions (≤ 30). The summary reports `highest_close` / `lowest_close` (closing prices, not intraday highs/lows) and the % change from the oldest session's reference price to the latest close |
+| `foreign_trading(symbol, days)` | Daily foreign buy/sell and net value (`days` = trading sessions, ≤ 25). Missing values stay `null` and are left out of the net and the `net_buy` / `net_sell` / `balanced` trend |
 | `valuation(symbol)` | P/E, P/B, ROE, ROA, EPS, etc. compared with the industry average |
-| `dividend_history(symbol, limit)` | Dividend history (cash / stock) |
+| `dividend_history(symbol, limit)` | Dividend history (`cash` / `stock` / `bonus_shares`), newest first |
 | `business_plan(symbol)` | Annual business plan and % completion |
-| `company_announcements(symbol, limit)` | Corporate disclosures (with PDF links) |
+| `company_announcements(symbol, limit)` | Corporate disclosures (with PDF links), `limit` ≤ 20 |
 
 ### Data source and disclaimer
 
@@ -102,20 +112,22 @@ and may change or be blocked at any time.
 > **For demo/sample use only.** This is not investment advice and must not be used for real
 > trading. Data may be delayed or inaccurate.
 
-**Units:** stock prices are in **thousand VND**; traded value / market capitalization are in **billion VND**.
+**Units:** stock prices are in **thousand VND**; traded value is in **billion VND**; volumes are in shares. Each result
+states the units it uses in its `units` object.
 
 ## Repo structure
 
 ```
-├── Dockerfile                # image: python:3.12-slim, port 8080, /health
-├── requirements.txt          # mcp + uvicorn + httpx
+├── Dockerfile                # image: python:3.12-slim, non-root (uid 10001), port 8080, /health
+├── requirements.txt          # runtime dependencies (bounded)
+├── requirements-dev.txt      # + pytest, pytest-asyncio, ruff, pyyaml
 ├── .env.example              # sample environment variables
 ├── deploy/                   # deployment outside Agent Runtime (not in the image)
-│   ├── vserver/              #   docker compose on vServer (+ optional Caddy TLS)
-│   ├── vks/                  #   Kubernetes manifests for VKS
+│   ├── vserver/              #   docker compose on vServer (+ optional Caddy TLS override)
+│   ├── vks/                  #   Kubernetes manifests for VKS (NodePort, internal only)
 │   └── onprem/               #   on-prem docker compose + check_connectivity.sh
 ├── src/mcp_server/main.py    # the entire server (single file)
-└── tests/                    # 43 hermetic tests (no network calls)
+└── tests/                    # hermetic tests (no network calls)
 ```
 
 ## Run locally
@@ -127,8 +139,11 @@ docker build -t stock-mcp-server .
 docker run --rm -p 8080:8080 -e MCP_API_KEYS="$KEY" stock-mcp-server
 
 # health — always open, no key required
-curl -s http://localhost:8080/health
+curl -s http://localhost:8080/health      # {"status":"ok","tools":13}
 ```
+
+The MCP endpoint is exactly `http://localhost:8080/mcp`; `/mcp/` (trailing slash) is **not** redirected and returns 404,
+so use the URL without the trailing slash in every connector / client.
 
 Call a tool with an MCP client (Python), passing the key in the `X-Api-Key` header:
 
@@ -156,7 +171,7 @@ asyncio.run(main())
 PY
 ```
 
-Run without Docker: `pip install -r requirements.txt && MCP_API_KEYS=$KEY python src/mcp_server/main.py`.
+Run without Docker (Python 3.11+): `pip install -r requirements.txt && MCP_API_KEYS=$KEY python src/mcp_server/main.py`.
 
 ## Authentication
 
@@ -168,20 +183,22 @@ The server validates the API key on the `/mcp` endpoint itself:
 
 | Item | Behavior |
 |---|---|
-| Configuration | The `MCP_API_KEYS` environment variable, a comma-separated list of keys. (The legacy `STOCK_API_KEY` is still accepted) |
-| Accepted headers | `X-Api-Key: <key>` · `Authorization: Bearer <key>` · `X-Stock-Api-Key: <key>` (legacy) |
-| Comparison | Constant-time; keys shorter than 24 characters trigger a log warning → use `openssl rand -hex 32` |
-| Key configured but caller's key is missing/wrong | `401` with `WWW-Authenticate` |
+| Configuration | The `MCP_API_KEYS` environment variable, a comma-separated list of keys |
+| Accepted headers | `X-Api-Key: <key>` · `Authorization: Bearer <key>` |
+| Key requirements | At least **32 characters** and not a placeholder (a key containing `<`, `>` or `change-me` is rejected) → use `openssl rand -hex 32` |
+| **Invalid key configured** | `503` + an error in the startup log naming the problem — one bad entry rejects the whole list, so a leftover placeholder never becomes a working key |
+| Key configured but caller's key is missing/wrong | `401` with `WWW-Authenticate` (constant-time comparison) |
 | **No key configured** | `503` — the server **never opens itself up** (fail-closed) |
-| `/health`, `/` | Always open (so the runtime can health-probe) |
+| `/health`, `/` | Always open (so the runtime can health-probe); `/health` returns only `{"status":"ok","tools":13}` |
 
-**Key rotation:** set two keys at the same time, `MCP_API_KEYS="old_key,new_key"` → update the key on the
-calling side (Access Control / connector) to `new_key` → remove `old_key` from the environment
-variable. No downtime.
+**Key rotation:** keys are read **once at startup**, so every change needs a restart / redeploy of the runtime.
+Set two keys at the same time, `MCP_API_KEYS="old_key,new_key"` (restart) → update the key on the
+calling side (Access Control / connector) to `new_key` → remove `old_key` from the environment variable (restart).
+No downtime as long as the restarts are rolling.
 
 **`ALLOW_ANONYMOUS=true`** is only for local runs when you do not want to set a key (`/mcp` is then fully open if
 `MCP_API_KEYS` is empty). **Never use it in a deployed environment.** If a key is configured,
-the key is still required even when `ALLOW_ANONYMOUS=true`.
+the key is still required even when `ALLOW_ANONYMOUS=true`; an invalid key (placeholder / too short) keeps `/mcp` locked.
 
 ### Layer 2: Agent Runtime Security Settings (platform level)
 
@@ -218,6 +235,7 @@ Create a runtime from the image above (console or the `agentbase-deploy` skill),
 
 ```bash
 export MCP_KEY=$(openssl rand -hex 32)   # RECORD IT — step 3 reuses the same value
+                                         # (the server rejects placeholders and keys shorter than 32 characters)
 
 # runtime env:
 #   MCP_API_KEYS=<value of $MCP_KEY>
@@ -258,7 +276,11 @@ Console → **MCP Gateway** → select the gateway → **Add Custom Connector**:
 Or via the API (JSON Merge Patch — **send the complete desired targets array**):
 
 ```bash
-TOKEN=$(bash ~/.agents/skills/agentbase/scripts/get_token.sh)
+# IAM token: client-credentials grant with the client id / secret of your IAM service account
+# (the same call as scripts/print_token.py in the sample-byo-agent-mcp-gateway repo)
+TOKEN=$(curl -s -u "$GREENNODE_CLIENT_ID:$GREENNODE_CLIENT_SECRET" -d grant_type=client_credentials \
+  https://iam.api.vngcloud.vn/accounts-api/v2/auth/token \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 curl -X PATCH "https://agentbase.api.vngcloud.vn/gateway/api/v1/gateways/<gw>" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -H 'If-Match: "<resourceVersion>"' \
@@ -327,7 +349,7 @@ endpoint, and in Private mode they run in the GreenNode-managed **AgentBase VPC 
 |---|---|---|---|
 | When to use | Fastest; GreenNode manages the infrastructure | The MCP server must not be exposed to the Internet and sits in a private VPC | Data/servers must stay in the data center |
 | **Gateway Network mode** | **Public** | **Private** (select the VPC + Subnet of the vServer/VKS) | **Private** + **Route CIDRs** including the on-prem CIDR |
-| **Connector URL** | `https://<endpoint>.agentbase-runtime.aiplatform.vngcloud.vn/mcp` | `https://xx.xx.x.x:8443/mcp` | `https://xx.xx.x.x:8443/mcp` (IP of the on-prem MCP host) |
+| **Connector URL** | `https://<endpoint>.agentbase-runtime.aiplatform.vngcloud.vn/mcp` | vServer: `http://xx.xx.x.x:8080/mcp` (`https://…:8443/mcp` with the Caddy TLS override) · VKS: `http://<node-private-ip>:30080/mcp` | `http://xx.xx.x.x:8080/mcp` over the VPN / Interconnect (`https://…:8443/mcp` only behind your own TLS proxy) |
 | **Outbound Auth** | API Key — header `X-Api-Key`, provider in Access Control | API Key — header `X-Api-Key`, provider in Access Control | API Key — header `X-Api-Key`, provider in Access Control |
 | Additional connectivity | — | The VPC must already be privately connected to AgentBase (contact GreenNode support), with DNS resolution enabled; security group allowing `172.30.0.0/16` | Site-to-Site VPN / Interconnect (customer side), bidirectional routes including `172.30.0.0/16`, firewall allowing `172.30.0.0/16` |
 | Guide | [Deploy to GreenNode AgentBase](#deploy-to-greennode-agentbase) (above) | [`deploy/vserver/`](deploy/vserver/README.md) · [`deploy/vks/`](deploy/vks/README.md) | [`deploy/onprem/`](deploy/onprem/README.md) |
@@ -340,6 +362,8 @@ Notes:
 - The server always calls the public 24hMoney API: on vServer / VKS allow outbound HTTPS through NAT or a proxy, on-premises
   through the data center's proxy / NAT, or point `STOCK_API_BASE_URL` at an internal mirror. See the diagram in
   [Architecture](#architecture).
+- In (b) and (c) the URL is plain `http://` unless you add TLS: the traffic stays on the private connection, and the repo ships a TLS option
+  only for vServer (`deploy/vserver/docker-compose.tls.yml`). The connector URL is always exactly `/mcp` (no trailing slash).
 - Wherever the server runs, **the Policy Group still uses the same `stock__<tool>` actions** (e.g. `stock__search_company`).
   Only the connector's Endpoint changes; there is no need to rewrite policies or agent code.
 - On the on-prem side, confirm with GreenNode whether the request source is NATed (it may no longer be `172.30.0.0/16`) before opening the firewall.
@@ -347,35 +371,46 @@ Notes:
 
 ## Technical architecture
 
-- **FastMCP** (`stateless_http=True`) — MCP streamable HTTP at `/mcp`.
-- **Shared `fetch_api()`**: GET requests use a **TTL cache** (session data 60s; valuation / dividends / business plan / announcements 15 minutes;
-  company directory 6 hours) and **3 retries** with backoff; `cache_hits` / `upstream_calls` metrics are exposed in `/health`.
-- **`symbol` validation** (`^[A-Z0-9]{2,10}$`) before it is composed into the upstream request; `limit`/`days` are clamped to the allowed range.
-- **Vietnam timezone** (`Asia/Ho_Chi_Minh`) for `last_update` and for detecting stale data after market close.
-- Runtime contract: port `8080` (override with `PORT`), `GET /health` → 200, `GET /` describes the server.
+- **FastMCP** (`stateless_http=True`) — MCP streamable HTTP at `/mcp`; tools return dicts (structured output) and raise `ToolError` on failure.
+- **Shared `fetch_api()`**: one lazily created `httpx.AsyncClient` (closed on shutdown by the app lifespan); the upstream
+  payload shape is validated **before** it is cached, and errors or empty payloads are never cached. The **TTL cache**
+  (session data 60s; valuation / dividends / business plan / announcements 15 minutes; company directory 6 hours)
+  drops expired entries and holds at most 512 entries. Concurrent cold calls for the same key share **one** upstream request.
+- **Retries**: at most 3 **attempts** per call (back-off 0.5s, then 1.5s), only for network errors, HTTP 5xx and 429. A 4xx
+  answer or a non-JSON body fails immediately with a short, status-specific message. `HTTP_TIMEOUT_SECONDS` is the total
+  budget for all attempts of one call.
+- **`symbol` validation** (`^[A-Z0-9]{2,10}$`, case-insensitive) before it is composed into the upstream request; `limit`/`days` are clamped to the allowed range.
+- **Untrusted upstream data**: numbers are coerced (`"62.1"` → `62.1`) or become `null`; unexpected shapes become a clean tool error, never a raw exception.
+- **Vietnam timezone** (`Asia/Ho_Chi_Minh`) for `last_update`, trading dates and for detecting stale data after market close.
+- Runtime contract: port `8080` (override with `PORT`, bind address with `HOST`), `GET /health` → 200 liveness only, `GET /` describes the server.
+- The container runs as the non-root user `10001` and has a `HEALTHCHECK` on `/health`.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_API_KEYS` | *(required)* | API keys protecting `/mcp`; multiple keys separated by `,` (rotation). Empty ⇒ `/mcp` returns 503 |
+| `MCP_API_KEYS` | *(required)* | API keys protecting `/mcp`; multiple keys separated by `,` (rotation). Each key ≥ 32 characters and not a placeholder. Empty or invalid ⇒ `/mcp` returns 503. Read once at startup |
 | `ALLOW_ANONYMOUS` | *(empty)* | `true` ⇒ allows `/mcp` without a key when no key is configured. **Local development only** |
 | `STOCK_API_BASE_URL` | `https://api-finance-t19.24hmoney.vn` | Override the data source (internal proxy/mirror) |
-| `HTTP_TIMEOUT_SECONDS` | `10` | Timeout for upstream API calls |
+| `HTTP_TIMEOUT_SECONDS` | `10` | Total time budget for the upstream work of one tool call (all attempts and back-offs included) |
 | `CACHE_TTL_SECONDS` | `60` | Cache TTL for session data (top stocks, prices, foreign trading) |
 | `SLOW_CACHE_TTL_SECONDS` | `900` | Cache TTL for slow-changing data (dividends, business plan, valuation, announcements) |
 | `COMPANY_CACHE_TTL_SECONDS` | `21600` | Cache TTL for the company directory (6 hours) |
 | `PORT` | `8080` | Listening port |
+| `HOST` | `0.0.0.0` | Bind address |
 
 ## Test
 
 ```bash
-pip install -r requirements.txt pytest pytest-asyncio
-python -m pytest tests/ -v   # 43 tests, hermetic — no network calls
+pip install -r requirements-dev.txt
+python -m pytest -v    # hermetic — the 24hMoney API is faked, no network calls
+ruff check --select F,E9,B,UP,SIM --target-version py312 src tests
 ```
 
-Coverage: market tool sorting/limits, `search_company` ranking, symbol validation, registration of all 13 tools,
-and the fail-closed auth middleware (503 / 401 / 3 header styles / 2-key rotation).
+Coverage: tool ranking / validation / output shapes, upstream type drift and malformed payloads, cache (no bad payloads,
+expiry, bounded size), request de-duplication, retry policy and time budget, fail-closed auth (placeholder / short keys,
+503 / 401, header styles, key rotation), `/health` not leaking configuration, `isError` results and structured output over
+real MCP calls, and the deploy files (`docker compose config` when Docker is installed).
 
 ## Related resources
 
