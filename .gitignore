@@ -4,5 +4,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
-data/
 .pytest_cache/
+.ruff_cache/
+.agentbase/
+
+# Real secrets and certificates for the deploy/ examples
+deploy/vks/secret.yaml
+deploy/**/certs/

@@ -1,11 +1,14 @@
 .git
 .github
+.agentbase
 tests
 __pycache__
 *.pyc
 .env
 .env.*
-!.env.example
 .venv
+.pytest_cache
+.ruff_cache
 README.md
 deploy/
+docs/
