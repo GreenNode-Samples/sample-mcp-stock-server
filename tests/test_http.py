@@ -148,6 +148,12 @@ def test_tool_metadata(mcp_client, authed):
             assert prop.get("description"), f"{tool['name']}.{name} has no description"
 
 
+def test_sort_parameter_is_an_enum_in_the_schema(mcp_client, m, authed):
+    tools = rpc(mcp_client, "tools/list", headers={"X-Api-Key": VALID_KEY}).json()["result"]["tools"]
+    sort = next(t for t in tools if t["name"] == "market_top_stocks")["inputSchema"]["properties"]["sort"]
+    assert set(sort["enum"]) == set(m.SORTS) and sort["description"]
+
+
 def test_tool_names_come_from_the_registry(mcp_client, authed):
     names = {t["name"] for t in rpc(mcp_client, "tools/list", headers={"X-Api-Key": VALID_KEY}).json()["result"]["tools"]}
     assert names == {"market_top_stocks", "top_gainers", "top_losers", "most_active", "stock_quote",
@@ -171,7 +177,7 @@ def test_success_is_structured_dict_output(mcp_client, m, monkeypatch, authed):
 
 @pytest.mark.parametrize("tool,args,message", [
     ("stock_quote", {"symbol": "no way"}, "Invalid stock symbol"),
-    ("market_top_stocks", {"sort": "bogus"}, "Invalid sort"),
+    ("market_top_stocks", {"sort": "bogus"}, "Input should be 'default'"),   # Literal validation
     ("search_company", {"query": "x"}, "at least 2 characters"),
     ("price_history", {"symbol": "FPT", "days": "abc"}, "validation"),   # wrong argument type
 ])

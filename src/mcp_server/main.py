@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -430,6 +430,9 @@ SORTS = {
 }
 
 
+SortKey = Literal["default", "change_percent", "value", "volume", "foreign_net_buy"]  # keys of SORTS
+
+
 def _clamp(value: int, hi: int) -> int:
     """Limit a count to 1..hi. Tool arguments are validated as integers before they reach the tools."""
     return max(1, min(hi, value))
@@ -470,6 +473,9 @@ def _result(payload: dict, units: dict | None = None) -> dict:
 
 # ────────────────────────────── MCP tools ──────────────────────────────
 
+# host="0.0.0.0" is required, do not remove it: with the default host (127.0.0.1) FastMCP enables DNS-rebinding
+# protection that only accepts Host headers of localhost, so every request forwarded by MCP Gateway (Host =
+# the runtime / VPC address) would be rejected. Access is controlled by the API key middleware below.
 mcp = FastMCP("vn-stock", stateless_http=True, json_response=True, host="0.0.0.0")
 
 # Every tool only reads data (readOnlyHint) from an external service (openWorldHint).
@@ -495,7 +501,7 @@ async def _ranked(limit: int, key=None, keep=None, reverse: bool = True) -> dict
 @mcp.tool(annotations=READ_ONLY)
 async def market_top_stocks(
     limit: Limit = 20,
-    sort: Annotated[str, Field(description=(
+    sort: Annotated[SortKey, Field(description=(
         "'default' (24hMoney recommendation order), 'change_percent' (+/- %), 'value' (traded value), "
         "'volume' (traded volume) or 'foreign_net_buy' (foreign net buy volume)."))] = "default",
 ) -> dict[str, Any]:
@@ -503,8 +509,6 @@ async def market_top_stocks(
 
     Example: market_top_stocks(limit=15, sort='value').
     """
-    if sort not in SORTS:
-        raise ToolError(f"Invalid sort '{sort}'. Choose one of: " + ", ".join(SORTS))
     return await _ranked(limit, SORTS[sort])
 
 

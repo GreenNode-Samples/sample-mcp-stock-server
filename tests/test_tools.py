@@ -74,10 +74,10 @@ async def test_top_stocks_sort_foreign_net_buy(m, monkeypatch):
     assert data["stocks"][0]["symbol"] == "TCB"  # 1.2M - 300k = +900k, the largest net foreign buy
 
 
-async def test_top_stocks_bad_sort(m, monkeypatch):
-    patch_api(m, monkeypatch, fresh_payload())
-    with pytest.raises(ToolError, match="Invalid sort 'xyz'"):
-        await m.market_top_stocks(limit=3, sort="xyz")
+def test_sort_values_match_the_schema_enum(m):
+    """The Literal type of `sort` (the enum the LLM sees) must list exactly the keys of SORTS."""
+    from typing import get_args
+    assert set(get_args(m.SortKey)) == set(m.SORTS)
 
 
 @pytest.mark.parametrize("limit,expected", [(0, 1), (-5, 1), (99, 6), (3, 3)])
