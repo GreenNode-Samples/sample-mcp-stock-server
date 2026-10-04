@@ -25,12 +25,8 @@ services:
       # With the Caddy TLS override set BIND_ADDR=127.0.0.1 so this port is not exposed.
       - "${BIND_ADDR:-0.0.0.0}:${MCP_PORT:-8080}:8080"
     healthcheck:
-      # python:3.12-slim has no curl, so the healthcheck uses python.
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"
+      # healthcheck.py ships in the image and probes HOST:PORT (python: the slim image has no curl).
+      test: ["CMD", "python", "healthcheck.py"]
       interval: 30s
       timeout: 5s
       retries: 3

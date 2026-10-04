@@ -127,6 +127,7 @@ states the units it uses in its `units` object.
 │   ├── vks/                  #   Kubernetes manifests for VKS (NodePort, internal only)
 │   └── onprem/               #   on-prem docker compose + check_connectivity.sh
 ├── src/mcp_server/main.py    # the entire server (single file)
+├── src/mcp_server/healthcheck.py  # container healthcheck (HOST/PORT aware)
 └── tests/                    # hermetic tests (no network calls)
 ```
 
@@ -383,7 +384,7 @@ Notes:
 - **Untrusted upstream data**: numbers are coerced (`"62.1"` → `62.1`) or become `null`; unexpected shapes become a clean tool error, never a raw exception.
 - **Vietnam timezone** (`Asia/Ho_Chi_Minh`) for `last_update`, trading dates and for detecting stale data after market close.
 - Runtime contract: port `8080` (override with `PORT`, bind address with `HOST`), `GET /health` → 200 liveness only, `GET /` describes the server.
-- The container runs as the non-root user `10001` and has a `HEALTHCHECK` on `/health`.
+- The container runs as the non-root user `10001` and has a `HEALTHCHECK` that runs `healthcheck.py`: it probes `/health` on `HOST`:`PORT` (127.0.0.1 when `HOST` is unset or a wildcard address).
 
 ## Environment variables
 
