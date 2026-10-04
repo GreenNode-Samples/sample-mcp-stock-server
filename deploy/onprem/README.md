@@ -10,20 +10,22 @@ on-prem MCP server. It uses the same image as the Agent Runtime / vServer / VKS 
 Agent → MCP Gateway (Private, AgentBase VPC 172.30.0.0/16)
       → private connection → customer VPC (Route CIDRs include the on-prem range)
       → Site-to-Site VPN / Interconnect (customer side) → DC firewall
-      → stock-mcp :8080 (or :8443 behind a TLS reverse proxy) → 24hMoney
+      → stock-mcp :8080 (plain HTTP; :8443 only if you add a TLS reverse proxy) → 24hMoney
 ```
 
 ## Run the container
 
 ```bash
 cd deploy/onprem
-cp .env.example .env && chmod 600 .env     # MCP_API_KEYS, BIND_ADDR=<internal IP>
+cp .env.example .env && chmod 600 .env     # replace the MCP_API_KEYS placeholder (openssl rand -hex 32), set BIND_ADDR=<internal IP>
 docker compose up -d --build
 docker compose ps                          # healthy
 curl -s http://<BIND_ADDR>:8080/health
 ```
 
 `BIND_ADDR` is the IP of the internal interface — the container does **not** listen on all interfaces.
+The server rejects the placeholder key and any key shorter than 32 characters (`/mcp` then answers 503).
+Keys are read once at startup: after changing `MCP_API_KEYS` run `docker compose up -d` again.
 
 ## Network checklist
 
@@ -31,7 +33,7 @@ curl -s http://<BIND_ADDR>:8080/health
 
 - [ ] The on-prem CIDR (`xx.xx.x.x/xx`) **does not overlap** the customer VPC CIDR (`xx.xx.x.x/xx`) and **does not overlap**
       `172.30.0.0/16` (the AgentBase VPC range).
-- [ ] Record the IP of the on-prem MCP host (`xx.xx.x.x`) and the port (`8080`/`8443`).
+- [ ] Record the IP of the on-prem MCP host (`xx.xx.x.x`) and the port (`8080`, or `8443` if you add TLS).
 
 ### 2. VPC ↔ data center connectivity (customer side)
 
@@ -58,9 +60,13 @@ curl -s http://<BIND_ADDR>:8080/health
 
 ### 5. TLS
 
-- [ ] The connector URL should be HTTPS: `https://xx.xx.x.x:8443/mcp`. Place a reverse proxy (Caddy/nginx — see the sample
-      in `../vserver/Caddyfile`) in front of the container, bound to `BIND_ADDR`.
-- [ ] The certificate must be issued by a **CA that the gateway trusts**. If you use an internal/self-signed CA, confirm with GreenNode how to provide the CA to the connector.
+- This sample serves **plain HTTP** on port `8080`: the connector URL is `http://xx.xx.x.x:8080/mcp`. The traffic crosses
+  the private connection (VPN / Interconnect) and never the Internet, but it is not encrypted by this sample.
+- If the connector must use HTTPS (`https://xx.xx.x.x:8443/mcp`), run a TLS reverse proxy (Caddy / nginx) in front of the
+  container, bound to `BIND_ADDR`. `../vserver/Caddyfile` and `../vserver/docker-compose.tls.yml` are a working Caddy
+  example you can adapt; this directory does not ship a TLS component.
+- The certificate must be issued by a **CA that the gateway trusts**. If you use an internal/self-signed CA, confirm with
+  GreenNode how to provide the CA to the connector.
 
 ### 6. DNS
 
@@ -73,11 +79,12 @@ Run on a host (for example, a vServer) in the customer VPC, **before** creating 
 
 ```bash
 MCP_API_KEY=<key> ./check_connectivity.sh xx.xx.x.x 8080 http
-MCP_API_KEY=<key> INSECURE=1 ./check_connectivity.sh xx.xx.x.x 8443 https   # internal cert
+MCP_API_KEY=<key> INSECURE=1 ./check_connectivity.sh xx.xx.x.x 8443 https   # only with a TLS proxy and an internal cert
 ```
 
 The script prints `PASS`/`FAIL` for three steps: ① TCP to host:port, ② `GET /health`, ③ JSON-RPC `tools/list` with
-`X-Api-Key`. It needs only `bash` + `curl`, and exits `0` if all three PASS.
+`X-Api-Key`. It needs only `bash` + `curl`, ignores `http_proxy` settings, does not put the key on the command line
+(so it is not visible in `ps`), and exits `0` if all three PASS.
 
 > Note: running the script from a host in the VPC only proves that the **VPC → on-prem** path works. The
 > **gateway (172.30.0.0/16) → on-prem** path also depends on the return route and the firewall (sections 3–4).
@@ -86,5 +93,6 @@ The script prints `PASS`/`FAIL` for three steps: ① TCP to host:port, ② `GET 
 
 1. A **Private** gateway (VPC + Subnet + Route CIDRs including the on-prem range).
 2. Access Control: an API Key provider (e.g. `stock-mcp-key`) = `MCP_API_KEYS`.
-3. Connector `stock`: Endpoint `https://xx.xx.x.x:8443/mcp`, Outbound Auth = **API Key**, header `X-Api-Key`.
+3. Connector `stock`: Endpoint `http://xx.xx.x.x:8080/mcp` (or `https://xx.xx.x.x:8443/mcp` behind your TLS proxy), exactly `/mcp`
+   with no trailing slash. Outbound Auth = **API Key**, header `X-Api-Key`.
 4. Policy Group: `stock__<tool>` actions as in the main README.

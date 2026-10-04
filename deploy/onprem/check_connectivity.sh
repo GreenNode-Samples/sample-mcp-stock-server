@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Kiểm tra kết nối tới MCP server (on-prem hoặc bất kỳ đâu) — chạy từ một host trong VPC khách hàng.
-# Chỉ cần bash + curl.
+# Check connectivity to the MCP server (on-prem or anywhere) - run it from a host in the customer's VPC.
+# Needs only bash + curl.
 #
-# Dùng:
+# Usage:
 #   MCP_API_KEY=<key> ./check_connectivity.sh <host> [port] [scheme]
 #   MCP_API_KEY=<key> ./check_connectivity.sh xx.xx.x.x 8443 https
 #
-# Biến môi trường: MCP_API_KEY (bắt buộc cho bước 3), INSECURE=1 (bỏ qua xác thực cert, khi dùng cert nội bộ),
-#                  TIMEOUT (giây, mặc định 5)
+# Environment: MCP_API_KEY (required for step 3), INSECURE=1 (skip certificate verification, for internal certs),
+#              TIMEOUT (whole seconds, default 5)
+#
+# curl ignores http_proxy / https_proxy here (the target is on a private network), and the API key is
+# passed to curl on stdin, so it never appears in the process list.
 set -u
+
+usage() {
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+}
 
 HOST="${1:-}"
 PORT="${2:-8080}"
@@ -16,62 +23,84 @@ SCHEME="${3:-http}"
 TIMEOUT="${TIMEOUT:-5}"
 
 if [[ -z "$HOST" || "$HOST" == "-h" || "$HOST" == "--help" ]]; then
-  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  usage
   exit 2
 fi
-command -v curl >/dev/null 2>&1 || { echo "FAIL: cần cài curl"; exit 2; }
+command -v curl >/dev/null 2>&1 || { echo "FAIL: curl is required"; exit 2; }
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || { echo "FAIL: TIMEOUT must be a whole number of seconds"; exit 2; }
 
 BASE="${SCHEME}://${HOST}:${PORT}"
-CURL_OPTS=(-sS --max-time "$TIMEOUT")
-[[ "${INSECURE:-0}" == "1" ]] && CURL_OPTS+=(-k)
+CURL_OPTS=(-sS --noproxy '*' --max-time "$TIMEOUT")
+if [[ "${INSECURE:-0}" == "1" ]]; then
+  CURL_OPTS+=(-k)
+fi
 
 fails=0
 pass() { printf 'PASS  %s\n' "$1"; }
-fail() { printf 'FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '      -> %s\n' "$2"; fails=$((fails + 1)); }
+fail() {
+  printf 'FAIL  %s\n' "$1"
+  if [[ -n "${2:-}" ]]; then
+    printf '      -> %s\n' "$2"
+  fi
+  fails=$((fails + 1))
+}
 
-echo "Mục tiêu: ${BASE}/mcp"
+echo "Target: ${BASE}/mcp"
 echo "-----------------------------------------------"
 
-# ---- Bước 1: TCP reachability (bash /dev/tcp, không cần nc) ----
+# ---- Step 1: TCP reachability ----
+# Plain bash /dev/tcp. HOST and PORT are passed to the inner bash as arguments (never spliced into the command
+# string) and a small watchdog enforces TIMEOUT, so no `timeout` binary is needed (macOS has none).
+# Only exit code 0 counts as success.
+tcp_probe() {
+  bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null &
+  local pid=$! i
+  for ((i = 0; i < TIMEOUT * 10; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return $?
+    fi
+    sleep 0.1
+  done
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 1
+}
 tcp_ok=0
-if command -v timeout >/dev/null 2>&1; then
-  timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${HOST}/${PORT}" 2>/dev/null && tcp_ok=1
-else
-  # macOS không có `timeout`: dùng curl để thử bắt tay TCP
-  curl -sS --max-time "$TIMEOUT" --connect-timeout "$TIMEOUT" -o /dev/null "http://${HOST}:${PORT}/" 2>/dev/null
-  rc=$?
-  # rc 7 (refused) / 28 (timeout) / 6 (DNS) = không tới được; các mã khác = đã kết nối được TCP
-  [[ $rc -ne 7 && $rc -ne 28 && $rc -ne 6 ]] && tcp_ok=1
+if tcp_probe "$HOST" "$PORT"; then
+  tcp_ok=1
 fi
 if [[ $tcp_ok -eq 1 ]]; then
   pass "[1/3] TCP ${HOST}:${PORT} reachable"
 else
-  fail "[1/3] TCP ${HOST}:${PORT} không kết nối được" \
-       "kiểm tra route (VPN/Interconnect), firewall/security group cho nguồn 172.30.0.0/16, và dịch vụ đang listen"
+  fail "[1/3] TCP ${HOST}:${PORT} cannot connect" \
+       "check the route (VPN/Interconnect), the firewall / security group for source 172.30.0.0/16, and that the service is listening"
 fi
 
-# ---- Bước 2: GET /health (không cần key) ----
+# ---- Step 2: GET /health (no key needed) ----
 if [[ $tcp_ok -eq 1 ]]; then
   body=$(curl "${CURL_OPTS[@]}" -o - -w '\n%{http_code}' "${BASE}/health" 2>&1)
   code=$(printf '%s' "$body" | tail -n1)
   if [[ "$code" == "200" ]]; then
     pass "[2/3] GET /health -> 200"
   else
-    fail "[2/3] GET /health -> ${code:-không có phản hồi}" \
-         "nếu là lỗi TLS: đặt INSECURE=1 hoặc cài CA nội bộ; kiểm tra scheme/port (${SCHEME}:${PORT})"
+    fail "[2/3] GET /health -> ${code:-no response}" \
+         "for a TLS error set INSECURE=1 or install the internal CA; check the scheme and port (${SCHEME}:${PORT})"
   fi
 else
-  fail "[2/3] GET /health bỏ qua (bước 1 thất bại)"
+  fail "[2/3] GET /health skipped (step 1 failed)"
 fi
 
-# ---- Bước 3: tools/list có xác thực ----
+# ---- Step 3: authenticated tools/list ----
 if [[ -z "${MCP_API_KEY:-}" ]]; then
-  fail "[3/3] tools/list bỏ qua" "đặt MCP_API_KEY=<key> rồi chạy lại"
+  fail "[3/3] tools/list skipped" "set MCP_API_KEY=<key> and run again"
 elif [[ $tcp_ok -ne 1 ]]; then
-  fail "[3/3] tools/list bỏ qua (bước 1 thất bại)"
+  fail "[3/3] tools/list skipped (step 1 failed)"
 else
-  resp=$(curl "${CURL_OPTS[@]}" -X POST "${BASE}/mcp" \
-    -H "X-Api-Key: ${MCP_API_KEY}" \
+  # Quote the key for a curl config file (backslash and double quote are escaped).
+  key_escaped="${MCP_API_KEY//\\/\\\\}"
+  key_escaped="${key_escaped//\"/\\\"}"
+  resp=$(printf 'header = "X-Api-Key: %s"\n' "$key_escaped" | curl "${CURL_OPTS[@]}" -K - -X POST "${BASE}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
@@ -81,21 +110,20 @@ else
   case "$code" in
     200)
       if printf '%s' "$out" | grep -q '"tools"'; then
-        n=$(printf '%s' "$out" | grep -o '"name"' | wc -l | tr -d ' ')
-        pass "[3/3] POST /mcp tools/list -> 200 (~${n} mục name; kỳ vọng 13 tools)"
+        pass "[3/3] POST /mcp tools/list -> 200 (tools listed)"
       else
-        fail "[3/3] POST /mcp -> 200 nhưng không thấy \"tools\" trong phản hồi" "${out:0:200}"
+        fail "[3/3] POST /mcp -> 200 but no \"tools\" in the response" "${out:0:200}"
       fi ;;
-    401) fail "[3/3] POST /mcp -> 401" "API key sai / thiếu — so lại với MCP_API_KEYS của server" ;;
-    503) fail "[3/3] POST /mcp -> 503" "server chưa cấu hình MCP_API_KEYS (fail-closed)" ;;
-    *)   fail "[3/3] POST /mcp -> ${code:-không có phản hồi}" "${out:0:200}" ;;
+    401) fail "[3/3] POST /mcp -> 401" "API key wrong or missing - compare it with MCP_API_KEYS on the server" ;;
+    503) fail "[3/3] POST /mcp -> 503" "the server has no valid MCP_API_KEYS (missing, a placeholder, or shorter than 32 characters) - see its log" ;;
+    *)   fail "[3/3] POST /mcp -> ${code:-no response}" "${out:0:200}" ;;
   esac
 fi
 
 echo "-----------------------------------------------"
 if [[ $fails -eq 0 ]]; then
-  echo "KẾT QUẢ: PASS (3/3)"
+  echo "RESULT: PASS (3/3)"
   exit 0
 fi
-echo "KẾT QUẢ: FAIL (${fails} bước lỗi)"
+echo "RESULT: FAIL (${fails} failed steps)"
 exit 1
