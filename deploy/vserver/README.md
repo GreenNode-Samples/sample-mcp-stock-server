@@ -7,7 +7,8 @@ It uses the same image as the Agent Runtime variant — only the place it runs d
 ```
 Agent → MCP Gateway (Private, AgentBase VPC 172.30.0.0/16)
       → private connection → customer VPC → vServer (private subnet)
-      → [Caddy :8443 TLS] → stock-mcp :8080 → 24hMoney
+      → stock-mcp :8080 → 24hMoney            (default: plain HTTP inside the private network)
+      → [Caddy :8443 TLS] → stock-mcp :8080   (optional TLS override)
 ```
 
 ## 1. Prepare the network
@@ -35,7 +36,9 @@ Agent → MCP Gateway (Private, AgentBase VPC 172.30.0.0/16)
 ```bash
 git clone <repo> && cd sample-mcp-stock-server/deploy/vserver
 cp .env.example .env && chmod 600 .env
-# edit .env: MCP_API_KEYS=$(openssl rand -hex 32)  — RECORD IT, reuse it in Access Control
+# edit .env: replace the MCP_API_KEYS placeholder with the output of `openssl rand -hex 32`
+#            (the server rejects the placeholder and keys shorter than 32 characters)
+#            RECORD the key, reuse it in Access Control
 
 docker compose up -d --build        # build from the repo's Dockerfile
 # or use the image on vCR: set MCP_IMAGE=vcr.vngcloud.vn/<repo>/stock-mcp-server:v1 in .env
@@ -46,12 +49,14 @@ curl -s http://localhost:8080/health
 ```
 
 Compose already sets `restart: unless-stopped` and a `GET /health` healthcheck
-(the slim image has no `curl`, so the healthcheck uses `python`).
+(the slim image has no `curl`, so the healthcheck uses `python`). The container runs as a non-root user.
+`.env` is read once at startup: after changing a key run `docker compose up -d` again.
 
-## 3. TLS (recommended)
+## 3. TLS (optional)
 
-The sample connector URL in the documentation is `https://xx.xx.x.x:8443/mcp`. If the connector's endpoint
-requires HTTPS, run Caddy in front:
+The default setup serves plain HTTP on port 8080: `http://xx.xx.x.x:8080/mcp`. The traffic stays on the private
+connection between the AgentBase VPC and your VPC. If the connector's endpoint requires HTTPS, add Caddy in front
+with the TLS override file `docker-compose.tls.yml` (a separate file, so the default path above needs no TLS settings):
 
 ```bash
 # .env
@@ -59,7 +64,7 @@ BIND_ADDR=127.0.0.1          # only Caddy is exposed externally
 CADDY_SITE=xx.xx.x.x         # the vServer's private IP (or an internal hostname)
 TLS_PORT=8443
 
-docker compose --profile tls up -d --build
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
 curl -ks https://xx.xx.x.x:8443/health
 ```
 
@@ -75,15 +80,17 @@ Remember to open the security group for port `8443` instead of `8080`.
 1. **Gateway**: create a gateway with Network mode **Private** (select the VPC + Subnet of the vServer; **cannot be
    changed after creation**).
 2. **Access Control**: create an API Key provider (e.g. `stock-mcp-key`) with exactly the value of `MCP_API_KEYS`.
-3. **Connector**: Endpoint `https://xx.xx.x.x:8443/mcp` (or `http://xx.xx.x.x:8080/mcp` without TLS),
-   Outbound Auth = **API Key**, header `X-Api-Key`, provider `stock-mcp-key`.
+3. **Connector**: Endpoint `http://xx.xx.x.x:8080/mcp` (or `https://xx.xx.x.x:8443/mcp` with the TLS override),
+   exactly `/mcp` with no trailing slash. Outbound Auth = **API Key**, header `X-Api-Key`, provider `stock-mcp-key`.
 4. **Policy Group**: keep the `stock__<tool>` actions exactly as in the main README.
 
-Quick check from another host in the VPC: `../onprem/check_connectivity.sh` (it also works for vServer).
+Quick check from another host in the VPC: `MCP_API_KEY=<key> ../onprem/check_connectivity.sh xx.xx.x.x 8080 http`
+(it also works for vServer).
 
 ## Updates / key rotation
 
 ```bash
 docker compose up -d --build            # after pulling new code
-# rotate key: MCP_API_KEYS="old_key,new_key" → docker compose up -d → change the key in Access Control → remove old_key
+# rotate key: MCP_API_KEYS="old_key,new_key" → docker compose up -d (a restart is needed: keys are read at startup)
+#             → change the key in Access Control → remove old_key → docker compose up -d
 ```

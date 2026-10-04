@@ -1,7 +1,7 @@
-# VN Stock MCP Server trong data center on-prem của khách hàng.
-#   cp .env.example .env   # điền MCP_API_KEYS, BIND_ADDR (IP interface nội bộ)
+# VN Stock MCP Server in the customer's on-prem data center.
+#   cp .env.example .env     # set MCP_API_KEYS and BIND_ADDR (IP of the internal interface)
 #   docker compose up -d --build
-# Gateway (Private, 172.30.0.0/16) gọi vào qua VPN/Interconnect — xem README.
+# The gateway (Private, 172.30.0.0/16) calls in over the VPN / Interconnect - see the README.
 name: stock-mcp
 
 services:
@@ -9,14 +9,14 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: ${MCP_IMAGE:-stock-mcp-server:latest}
+    image: ${MCP_IMAGE:-stock-mcp-server:local}
     restart: unless-stopped
     env_file: .env
     environment:
       PORT: "8080"
     ports:
-      # Chỉ bind vào interface nội bộ (BIND_ADDR), không phải 0.0.0.0.
-      - "${BIND_ADDR:?đặt BIND_ADDR=<IP nội bộ> trong .env}:${MCP_PORT:-8080}:8080"
+      # Bind only to the internal interface (BIND_ADDR), never to 0.0.0.0.
+      - "${BIND_ADDR:?set BIND_ADDR=<internal IP> in .env}:${MCP_PORT:-8080}:8080"
     healthcheck:
       test:
         - CMD

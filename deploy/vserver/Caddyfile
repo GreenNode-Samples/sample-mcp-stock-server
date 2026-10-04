@@ -1,20 +1,20 @@
-# Reverse proxy TLS cho MCP server (chỉ dùng với `docker compose --profile tls`).
-# CADDY_SITE = IP private của vServer (xx.xx.x.x) hoặc hostname nội bộ.
+# TLS reverse proxy for the MCP server (used by docker-compose.tls.yml).
+# CADDY_SITE = the vServer's private IP (xx.xx.x.x) or an internal hostname.
 {
-	# Không xin cert công khai (ACME) — vServer nằm trong mạng private.
+	# Do not request a public certificate (ACME) - the vServer sits in a private network.
 	auto_https disable_redirects
 }
 
 https://{$CADDY_SITE}:8443 {
-	# Cert do CA nội bộ của Caddy tự cấp. Gateway phải tin CA này
-	# -> xác nhận với GreenNode cách import CA tuỳ chỉnh vào connector.
+	# The certificate is issued by Caddy's own internal CA. The gateway must trust that CA
+	# -> confirm with GreenNode how to import a custom CA into the connector.
 	tls internal
 
-	# Hoặc dùng cert do CA doanh nghiệp cấp (mount ./certs trong docker-compose.yml):
+	# Or use a certificate from your enterprise CA (mount ./certs, see docker-compose.tls.yml):
 	# tls /certs/server.crt /certs/server.key
 
 	reverse_proxy mcp:8080 {
-		# MCP streamable HTTP: đẩy dữ liệu ngay, không buffer
+		# MCP streamable HTTP: flush data immediately, no buffering
 		flush_interval -1
 	}
 }

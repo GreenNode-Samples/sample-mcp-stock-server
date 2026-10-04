@@ -1,0 +1,24 @@
+# Optional TLS for the vServer deployment: Caddy terminates HTTPS on :8443 and proxies to the mcp service.
+# Use it as an override of docker-compose.yml (it is not valid on its own):
+#
+#   # in .env: BIND_ADDR=127.0.0.1  CADDY_SITE=<private IP of the vServer>
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+services:
+  caddy:
+    image: caddy:2.11.6
+    restart: unless-stopped
+    depends_on:
+      mcp:
+        condition: service_healthy
+    environment:
+      CADDY_SITE: ${CADDY_SITE:?set CADDY_SITE=<private IP of the vServer> in .env}
+    ports:
+      - "${TLS_PORT:-8443}:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      # To use your own certificate instead of `tls internal`: uncomment this line and edit the Caddyfile.
+      # - ./certs:/certs:ro
+
+volumes:
+  caddy_data:
