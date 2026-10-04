@@ -1,92 +1,103 @@
-"""Pytest fixtures — import module MCP server từ src/mcp_server (không cần install)."""
+"""Pytest fixtures: import the server from src/mcp_server (no install needed) and fake 24hMoney.
 
+The upstream API is faked with `httpx.MockTransport`, so the tests never touch the network.
+"""
+
+import inspect
 import sys
-import time as _time
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+from starlette.testclient import TestClient
 
-SRC = Path(__file__).resolve().parents[1] / "src" / "mcp_server"
-sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "mcp_server"))
 
 import main as stock_main  # noqa: E402
 
+VALID_KEY = "k" * 32
 
-@pytest.fixture()
+
+@pytest.fixture(scope="session")
 def m():
     return stock_main
 
 
+@pytest.fixture(scope="session")
+def mcp_client(m):
+    """One TestClient for the whole run: the MCP session manager can only be started once per process."""
+    with TestClient(m.app) as client:
+        yield client
+
+
 @pytest.fixture(autouse=True)
-def clean_cache(m, monkeypatch):
-    """Cache là state toàn cục — xoá + reset đếm sau mỗi test."""
+def isolate_state(m, monkeypatch):
+    """Cache, in-flight requests and the HTTP client are module state: reset them for every test."""
     m._cache.clear()
-    m._stats["upstream_calls"] = 0
-    m._stats["cache_hits"] = 0
-    # test không đợi backoff
-    async def _no_sleep(_s):
-        return None
-    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
+    m._inflight.clear()
+    monkeypatch.setattr(m, "RETRY_DELAYS", (0, 0))  # same number of attempts, no waiting
+
+    def no_network(request):
+        raise AssertionError(f"test made an unfaked upstream call: {request.url.path}")
+
+    # Safety net: a test that forgets to install a fake can never reach the real API.
+    monkeypatch.setattr(m, "_client", httpx.AsyncClient(transport=httpx.MockTransport(no_network)))
     yield
     m._cache.clear()
+    m._inflight.clear()
 
 
-class FakeResponse:
-    def __init__(self, payload: dict, status: int = 200):
-        self._payload = payload
-        self.status_code = status
+class Upstream:
+    """Fake 24hMoney. Records every request and answers from `responder`:
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise Exception(f"HTTP {self.status_code}")
+    - a dict            -> 200 with that JSON body
+    - routes(**by_path) -> 200 with the body of the path the request ends with, 404 otherwise
+    - a callable        -> called with the request; returns an httpx.Response (may be async)
+    """
 
-    def json(self):
-        return self._payload
+    def __init__(self, responder):
+        self.responder = responder
+        self.requests: list[httpx.Request] = []
 
+    @property
+    def calls(self) -> int:
+        return len(self.requests)
 
-class FakeClient:
-    """httpx.AsyncClient giả — trả payload 24hMoney, đếm số call thật."""
-
-    def __init__(self, payload: dict):
-        self._payload = payload
-        self.calls = 0
-        self.urls: list = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    async def get(self, url, params=None):
-        self.calls += 1
-        self.urls.append((url, dict(params or {})))
-        payload = self._payload
-        if isinstance(payload, dict) and "__routes__" in payload:
-            # route theo path: {"__routes__": {"/v1/...": payload}}
-            for path, body in payload["__routes__"].items():
-                if url.endswith(path):
-                    return FakeResponse(body)
-            return FakeResponse({"status": 404}, status=404)
-        return FakeResponse(payload)
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        responder = self.responder
+        if callable(responder):
+            out = responder(request)
+            return await out if inspect.isawaitable(out) else out
+        if isinstance(responder, dict) and "__routes__" in responder:
+            for path, body in responder["__routes__"].items():
+                if request.url.path.endswith(path):
+                    return httpx.Response(200, json=body)
+            return httpx.Response(404, json={"status": 404})
+        return httpx.Response(200, json=responder)
 
 
-def make_api_payload(stocks: list[dict], last_update_ms: int) -> dict:
-    return {"message": "success", "status": 200,
-            "data": {"stocks": stocks, "last_update": last_update_ms}}
+def patch_api(m, monkeypatch, responder) -> Upstream:
+    """Point the server's HTTP client at a fake upstream."""
+    upstream = Upstream(responder)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(upstream), headers=m.BROWSER_HEADERS)
+    monkeypatch.setattr(m, "_client", client)
+    return upstream
 
 
-def patch_api(m, monkeypatch, payload: dict) -> FakeClient:
-    """Monkeypatch httpx.AsyncClient trong fetch_top_stocks."""
-    fake = FakeClient(payload)
+def ok(data) -> dict:
+    """A successful 24hMoney response envelope."""
+    return {"message": "success", "status": 200, "data": data}
 
-    # QUAN TRỌNG: phải là hàm THƯỜNG trả FakeClient (context manager),
-    # không được async def (sẽ trả coroutine → `async with` fail)
-    def fake_client(*args, **kwargs):
-        return fake
 
-    monkeypatch.setattr(m.httpx, "AsyncClient", fake_client)
-    return fake
+def routes(**by_path) -> dict:
+    """Responses for several endpoints: routes(**{"/v1/x": ok([...])})."""
+    return {"__routes__": by_path}
+
+
+def make_api_payload(stocks: list[dict], last_update: int) -> dict:
+    return ok({"stocks": stocks, "last_update": last_update})
 
 
 SAMPLE_STOCKS = [
@@ -111,21 +122,11 @@ SAMPLE_STOCKS = [
      "floor_price": 9.9, "change": -1.0, "change_percent": -9.09,
      "accumylated_vol": 40000000, "accumulated_val": 400.0,
      "buy_foreign_qtty": 0, "sell_foreign_qtty": 2000000},
-    {"symbol": "HNX-A", "price": 20.0, "basic_price": 16.0, "ceiling_price": 20.0,
+    {"symbol": "HNXA", "price": 20.0, "basic_price": 16.0, "ceiling_price": 20.0,
      "floor_price": 14.4, "change": 4.0, "change_percent": 25.0,
      "accumylated_vol": 1000, "accumulated_val": 0.02,
      "buy_foreign_qtty": 0, "sell_foreign_qtty": 0},
 ]
 
-import time as _time
-FRESH_S = int(_time.time())            # epoch giây "vừa cập nhật"
-STALE_S = int(_time.time() - 3600)     # 1 giờ trước → phải có cảnh báo hết phiên
-
-
-def ok(data) -> dict:
-    return {"message": "success", "status": 200, "data": data}
-
-
-def routes(**by_path) -> dict:
-    """Payload nhiều endpoint: routes(**{"/v1/x": ok([...])})."""
-    return {"__routes__": by_path}
+FRESH_S = int(time.time())          # epoch seconds, "just updated"
+STALE_S = int(time.time() - 3600)   # one hour ago: the market-closed note must appear

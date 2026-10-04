@@ -1,41 +1,45 @@
-"""VN Stock MCP Server — MCP server THUẦN (không agent, không LLM, không memory).
+"""VN Stock MCP Server - a pure MCP server (no agent, no LLM, no memory).
 
-Mô hình mẫu: **1 Agent Runtime chỉ để expose tools** — deploy như Custom Agent runtime
-trên AgentBase (port 8080, GET /health), rồi đăng ký làm **MCP Connector** trong
-**MCP Gateway** → mọi agent đi qua gateway (được Policy Group cho phép) gọi tools
-chứng khoán Việt Nam mà không cần biết server này ở đâu.
+Sample pattern: **one Agent Runtime that only exposes tools**. Deploy it as a Custom Agent runtime
+on AgentBase (port 8080, GET /health), then register it as an **MCP Connector** in **MCP Gateway**.
+Every agent that goes through the gateway (and is allowed by a Policy Group) can then call the
+Vietnamese stock-market tools without knowing where this server runs.
 
-Dữ liệu: các API công khai mà web/app 24hmoney.vn dùng (`api-finance-t19.24hmoney.vn`).
-Đây là API không chính thức — chỉ dùng cho demo/sample, không dùng cho giao dịch thật.
+Data: the public APIs used by the 24hmoney.vn web app (`api-finance-t19.24hmoney.vn`).
+This is an unofficial API - for demo / sample use only, never for real trading.
 
 Tools (13):
-  Thị trường (1 nguồn top-stock-all, cache 60s)
-    - market_top_stocks(limit, sort) · top_gainers · top_losers · most_active · stock_quote
-  Doanh nghiệp / mã cổ phiếu
-    - search_company(query)       → tìm mã theo tên / mã (1.6k công ty HOSE · HNX · UPCOM)
-    - company_profile(symbol)     → tên, sàn, mô tả doanh nghiệp
-    - price_history(symbol, days) → giá đóng cửa, KL, GT theo ngày (≤ 30 phiên)
-    - foreign_trading(symbol, days) → khối ngoại mua/bán theo ngày (≤ 25 phiên)
-    - valuation(symbol)           → P/E, P/B, ROE, ROA, EPS… so với trung bình ngành
-    - dividend_history(symbol)    → lịch sử cổ tức (tiền mặt / cổ phiếu)
-    - business_plan(symbol)       → kế hoạch năm & % hoàn thành
-    - company_announcements(symbol) → tin công bố thông tin (kèm link PDF)
+  Market (one shared source, `top-stock-all`, cached 60s)
+    - market_top_stocks(limit, sort) / top_gainers / top_losers / most_active / stock_quote
+  Companies / tickers
+    - search_company(query, limit)    -> find a ticker by name or ticker (~1.6k HOSE / HNX / UPCOM companies)
+    - company_profile(symbol)         -> name, exchange, business description
+    - price_history(symbol, days)     -> daily close, volume, value (up to 30 sessions)
+    - foreign_trading(symbol, days)   -> daily foreign buy/sell (up to 25 sessions)
+    - valuation(symbol)               -> P/E, P/B, ROE, ROA, EPS... vs the industry average
+    - dividend_history(symbol, limit) -> cash / stock dividend history
+    - business_plan(symbol)           -> annual plan and % completed
+    - company_announcements(symbol, limit) -> corporate disclosures (with document links)
 
-Auth (fail-closed): /mcp bắt buộc API key.
-  - MCP_API_KEYS="key1,key2"  (nhiều key để xoay vòng; STOCK_API_KEY vẫn được nhận)
-  - Header: `X-Api-Key: <key>` hoặc `Authorization: Bearer <key>` (`X-Stock-Api-Key` cũ vẫn nhận)
-  - Không cấu hình key → /mcp trả 503 (không bao giờ tự mở). Chỉ khi chạy local mới
-    đặt ALLOW_ANONYMOUS=true.
-  - /health và / luôn mở (runtime health-probe).
-  Khi đi qua MCP Gateway: connector `stock` đặt Outbound Auth = API Key, secret lưu ở
-  Access Control → gateway gắn header khi forward, agent không bao giờ thấy key.
+Results: every tool returns a dict (MCP structured output). Failures raise ToolError, so the MCP result
+has `isError: true` and a short message the agent can read. Every result carries `source`; results that
+contain numbers also carry `units`. Dates are `YYYY-MM-DD`, timestamps are ISO 8601 with the +07:00 offset.
+
+Auth (fail-closed): /mcp requires an API key.
+  - MCP_API_KEYS="key1,key2" (several keys allow rotation; read once at startup, so a restart is needed).
+  - Header: `X-Api-Key: <key>` or `Authorization: Bearer <key>`.
+  - Every key must be at least 32 characters and must not be a placeholder (contain `<`, `>` or `change-me`).
+    A bad key makes /mcp answer 503 and logs the reason at startup; the server never opens itself up.
+  - No key configured -> /mcp answers 503. Only for local development set ALLOW_ANONYMOUS=true.
+  - /health and / are always open (runtime health probe).
+  Behind MCP Gateway the connector `stock` uses Outbound Auth = API Key, the secret lives in Access
+  Control and the gateway adds the header when it forwards the call, so agents never see the key.
 """
-
-from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -43,19 +47,26 @@ import secrets
 import string
 import time
 import unicodedata
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 import httpx
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vn-stock-mcp")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every request URL, which carries the device_id
 
-# ────────────────────────── Cấu hình (env-overridable) ──────────────────────────
+# ────────────────────────── Configuration (env-overridable) ──────────────────────────
 
 API_BASE = os.environ.get(
     "STOCK_API_BASE_URL", "https://api-finance-t19.24hmoney.vn"
@@ -69,32 +80,74 @@ DIVIDEND_PATH = "/v1/ios/company/dividend-schedule"
 PLAN_PATH = "/v1/ios/company/plan"
 ANNOUNCEMENT_PATH = "/v1/web/announcement"
 
+SOURCE = "24hmoney.vn"
+
+# Total time budget (seconds) for the upstream work of one tool call: all attempts and back-offs included.
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "10"))
-CACHE_TTL = int(os.environ.get("CACHE_TTL_SECONDS", "60"))        # dữ liệu phiên
-SLOW_TTL = int(os.environ.get("SLOW_CACHE_TTL_SECONDS", "900"))    # cổ tức, kế hoạch, định giá, tin
-COMPANY_TTL = int(os.environ.get("COMPANY_CACHE_TTL_SECONDS", "21600"))  # danh bạ công ty (6h)
+CACHE_TTL = int(os.environ.get("CACHE_TTL_SECONDS", "60"))  # session data
+SLOW_TTL = int(os.environ.get("SLOW_CACHE_TTL_SECONDS", "900"))  # dividends, plan, valuation, announcements
+COMPANY_TTL = int(os.environ.get("COMPANY_CACHE_TTL_SECONDS", "21600"))  # company directory (6h)
 
-
-def _load_api_keys() -> list[str]:
-    raw = os.environ.get("MCP_API_KEYS") or os.environ.get("STOCK_API_KEY") or ""
-    return [k.strip() for k in raw.split(",") if k.strip()]
-
-
-API_KEYS = _load_api_keys()
-ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "").strip().lower() in ("1", "true", "yes")
-for _k in API_KEYS:
-    if len(_k) < 24:
-        log.warning("MCP_API_KEYS có key ngắn hơn 24 ký tự — nên dùng `openssl rand -hex 32`")
+# Seconds to wait before attempt 2 and attempt 3; so a call makes at most len(RETRY_DELAYS) + 1 attempts.
+RETRY_DELAYS = (0.5, 1.5)
+MAX_CACHE_ENTRIES = 512
 
 TZ_VN = ZoneInfo("Asia/Ho_Chi_Minh")
-STALE_AFTER = 15 * 60  # quá 15 phút không cập nhật → có thể đã hết phiên
+STALE_AFTER = 15 * 60  # no update for 15 minutes -> the market may be closed
 
-MAX_LIMIT = 30
+MAX_LIMIT = 30  # list tools
+MAX_HISTORY_DAYS = 30  # price_history
+MAX_FOREIGN_DAYS = 25  # foreign_trading
+MAX_ANNOUNCEMENTS = 20  # company_announcements
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,10}$")
 
 
+# ────────────────────────────── Authentication config ──────────────────────────────
+
+MIN_KEY_LENGTH = 32
+PLACEHOLDER_MARKER = "change-me"  # the example env files ship `change-me-run-openssl-rand-hex-32`
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    keys: tuple[str, ...]
+    problems: tuple[str, ...]  # reasons the configured keys are rejected; non-empty -> /mcp is locked
+    allow_anonymous: bool
+
+
+def _load_auth(raw_keys: str, allow_anonymous: bool) -> AuthConfig:
+    """Parse MCP_API_KEYS and reject keys that are placeholders or too weak to be real secrets."""
+    keys = tuple(k.strip() for k in raw_keys.split(",") if k.strip())
+    problems = []
+    for i, key in enumerate(keys, start=1):
+        if "<" in key or ">" in key or PLACEHOLDER_MARKER in key.lower():
+            problems.append(f"MCP_API_KEYS entry #{i} is a placeholder - generate a key with `openssl rand -hex 32`")
+        elif len(key) < MIN_KEY_LENGTH:
+            problems.append(f"MCP_API_KEYS entry #{i} is shorter than {MIN_KEY_LENGTH} characters")
+    return AuthConfig(keys, tuple(problems), allow_anonymous)
+
+
+AUTH = _load_auth(
+    os.environ.get("MCP_API_KEYS", ""),
+    os.environ.get("ALLOW_ANONYMOUS", "").strip().lower() in ("1", "true", "yes"),
+)
+for _problem in AUTH.problems:
+    log.error("%s - /mcp will answer 503 until it is fixed", _problem)
+
+
+def _describe_auth() -> str:
+    if AUTH.problems:
+        return "locked (invalid MCP_API_KEYS)"
+    if AUTH.keys:
+        return f"api-key ({len(AUTH.keys)} key)"
+    return "anonymous (ALLOW_ANONYMOUS, local use only)" if AUTH.allow_anonymous else "locked (MCP_API_KEYS not set)"
+
+
+# ────────────────────────── Upstream client + cache ──────────────────────────
+
+
 def _browser_id() -> str:
-    """device_id/browser_id kiểu app 24hmoney web sinh: web + epoch_ms + random."""
+    """device_id / browser_id the way the 24hmoney web app generates it: web + epoch_ms + random."""
     rand = "".join(random.choices(string.hexdigits.lower(), k=24))
     return f"web{int(time.time() * 1000)}{rand}"
 
@@ -126,291 +179,402 @@ API_PARAMS = {
     "browser_id": DEVICE_ID,
 }
 
-# ────────────────────────── HTTP + TTL cache (async) ──────────────────────────
+_client: httpx.AsyncClient | None = None  # created lazily, closed by the app lifespan
+_cache: dict[str, tuple[float, Any]] = {}  # key -> (expires_at, payload); insertion-ordered
+_inflight: dict[str, asyncio.Task] = {}  # key -> the upstream request currently running for it
 
-_cache: dict[str, tuple[float, object]] = {}
-_stats = {"upstream_calls": 0, "cache_hits": 0}
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=BROWSER_HEADERS)
+    return _client
 
 
-def _cache_get(key: str):
+async def _close_client() -> None:
+    global _client
+    client, _client = _client, None
+    if client is not None:
+        await client.aclose()
+
+
+def _cache_get(key: str) -> Any | None:
     hit = _cache.get(key)
-    if hit and hit[0] > time.monotonic():
-        _stats["cache_hits"] += 1
-        return hit[1]
-    return None
+    return hit[1] if hit and hit[0] > time.monotonic() else None
 
 
-def _cache_put(key: str, ttl: int, value) -> None:
-    _cache[key] = (time.monotonic() + ttl, value)
+def _cache_put(key: str, ttl: int, value: Any) -> None:
+    """Store a payload; drop expired entries first and keep at most MAX_CACHE_ENTRIES (oldest out)."""
+    now = time.monotonic()
+    for stale in [k for k, (expires, _) in _cache.items() if expires <= now]:
+        del _cache[stale]
+    _cache.pop(key, None)
+    _cache[key] = (now + ttl, value)
+    while len(_cache) > MAX_CACHE_ENTRIES:
+        del _cache[next(iter(_cache))]
 
 
-async def fetch_api(path: str, params: dict | None = None, *, cache_key: str, ttl: int):
-    """GET 1 endpoint 24hMoney → trả `data` (dict/list). TTL cache + retry 3 lần (GET idempotent)."""
+def _unexpected(detail: str) -> ToolError:
+    return ToolError(f"24hMoney API returned an unexpected data format ({detail}).")
+
+
+def _status_message(code: int) -> str:
+    hint = {400: "bad request", 401: "unauthorized", 403: "access denied", 404: "not found"}.get(code)
+    detail = f"HTTP {code}, {hint}" if hint else f"HTTP {code}"
+    return f"24hMoney API rejected the request ({detail})."
+
+
+async def _get_json(path: str, query: dict) -> Any:
+    """GET one endpoint. Retries only transport errors, HTTP 5xx and 429; any other failure ends the call."""
+    client = _get_client()
+    problem = ""
+    for delay in (*RETRY_DELAYS, None):
+        try:
+            res = await client.get(API_BASE + path, params=query)
+        except httpx.TransportError as e:
+            problem = f"network error: {type(e).__name__}"
+        except httpx.HTTPError as e:
+            log.warning("upstream %s failed: %s", path, type(e).__name__)
+            raise ToolError("24hMoney API request failed.") from None
+        else:
+            if res.is_success:
+                try:
+                    return res.json()
+                except ValueError:
+                    raise _unexpected("not JSON") from None
+            if res.status_code != 429 and res.status_code < 500:
+                raise ToolError(_status_message(res.status_code))
+            problem = f"HTTP {res.status_code}"
+        if delay is None:
+            raise ToolError(
+                f"24hMoney API is unavailable ({problem}) after {len(RETRY_DELAYS) + 1} attempts. Try again later."
+            )
+        log.warning("upstream %s: %s, retrying in %.1fs", path, problem, delay)
+        await asyncio.sleep(delay)
+
+
+async def _load(key: str, path: str, query: dict, ttl: int, parse) -> Any:
+    try:
+        async with asyncio.timeout(HTTP_TIMEOUT):
+            body = await _get_json(path, query)
+    except TimeoutError:
+        raise ToolError(f"24hMoney API did not answer within {HTTP_TIMEOUT:g}s. Try again later.") from None
+    if not isinstance(body, dict) or body.get("status") != 200 or "data" not in body:
+        raise _unexpected("unknown response envelope")
+    data = parse(body["data"])  # validate the shape BEFORE caching
+    if data:  # never cache an empty payload
+        _cache_put(key, ttl, data)
+    return data
+
+
+def _release(key: str, task: asyncio.Task) -> None:
+    if _inflight.get(key) is task:
+        del _inflight[key]
+    if not task.cancelled():
+        task.exception()  # mark as retrieved: every waiter may have gone away already
+
+
+async def fetch_api(path: str, params: dict | None = None, *, cache_key: str, ttl: int, parse) -> Any:
+    """Return the validated `data` of one 24hMoney endpoint.
+
+    `parse(data)` checks the shape (raising ToolError when it is wrong) and returns the cleaned payload.
+    Only valid, non-empty payloads are cached. Concurrent cold calls with the same `cache_key` share one
+    upstream request, which keeps running even if one of the callers is cancelled.
+    """
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+    task = _inflight.get(cache_key)
+    if task is None:
+        task = asyncio.create_task(_load(cache_key, path, {**API_PARAMS, **(params or {})}, ttl, parse))
+        _inflight[cache_key] = task
+        task.add_done_callback(partial(_release, cache_key))
+    return await asyncio.shield(task)
 
-    url = API_BASE + path
-    query = {**API_PARAMS, **(params or {})}
-    last_err: Exception | None = None
-    for attempt in range(3):  # backoff 0.5 → 1.5s
-        try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=BROWSER_HEADERS) as client:
-                res = await client.get(url, params=query)
-                res.raise_for_status()
-                body = res.json()
-            if body.get("status") != 200 or "data" not in body:
-                raise ValueError(f"payload lạ từ 24hMoney: status={body.get('status')}")
-            _stats["upstream_calls"] += 1
-            data = body["data"]
-            _cache_put(cache_key, ttl, data)
-            return data
-        except (httpx.HTTPError, ValueError, KeyError) as e:
-            last_err = e
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (3 ** attempt))
-    raise RuntimeError(f"24hMoney API không phản hồi sau 3 lần thử: {last_err}")
+
+def _parse_rows(data: Any) -> list[dict]:
+    if not isinstance(data, list):
+        raise _unexpected("expected a list")
+    return [row for row in data if isinstance(row, dict)]
+
+
+def _parse_object(data: Any) -> dict:
+    if not isinstance(data, dict):
+        raise _unexpected("expected an object")
+    return data
+
+
+def _parse_top_stocks(data: Any) -> dict:
+    stocks = _parse_object(data).get("stocks")
+    if not isinstance(stocks, list):
+        raise _unexpected("missing stock list")
+    rows = [s for s in stocks if isinstance(s, dict)]
+    if not rows:
+        raise ToolError("24hMoney API returned an empty list of top stocks. Try again later.")
+    return {"stocks": rows, "last_update": data.get("last_update")}
+
+
+def _parse_companies(data: Any) -> list[dict]:
+    rows = _parse_rows(data)
+    if not rows:
+        raise ToolError("24hMoney API returned an empty company directory. Try again later.")
+    return rows
 
 
 async def fetch_top_stocks() -> dict:
-    """~90 mã top thị trường (giá, +/-%, KL, GT, ngoại)."""
-    data = await fetch_api(TOP_STOCK_PATH, cache_key="top-stocks", ttl=CACHE_TTL)
-    if not isinstance(data, dict) or not data.get("stocks"):
-        _cache.pop("top-stocks", None)
-        raise RuntimeError("24hMoney trả về danh sách top cổ phiếu rỗng")
-    return {"stocks": data["stocks"], "last_update": data.get("last_update")}
+    """~90 top market stocks (price, +/-%, volume, value, foreign flow): {"stocks": [...], "last_update": ts}."""
+    return await fetch_api(TOP_STOCK_PATH, cache_key="top-stocks", ttl=CACHE_TTL, parse=_parse_top_stocks)
 
 
 async def fetch_companies() -> list[dict]:
-    """Danh bạ ~1.6k công ty niêm yết (HOSE · HNX · UPCOM) — cache 6h."""
-    data = await fetch_api(COMPANY_ALL_PATH, {"time_updated": 0},
-                           cache_key="companies", ttl=COMPANY_TTL)
-    return data if isinstance(data, list) else []
+    """Directory of ~1.6k listed companies (HOSE / HNX / UPCOM), cached 6h."""
+    return await fetch_api(COMPANY_ALL_PATH, {"time_updated": 0}, cache_key="companies",
+                           ttl=COMPANY_TTL, parse=_parse_companies)
 
 
-# ────────────────────── Chuẩn hoá & tiện ích ──────────────────────
+# ────────────────────────── Normalisation helpers ──────────────────────────
+# Upstream values are untrusted: a field may be missing, null or have drifted to another type.
+# These helpers turn anything unexpected into None / "" so the tools never raise on bad data.
+
+
+def _num(value: Any) -> int | float | None:
+    """A finite number, or None. Numeric strings are accepted; booleans and everything else are not."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return value
+    return None
+
+
+def _zero(value: Any) -> int | float:
+    """Like _num but a missing value counts as 0 - only for sorting and filtering."""
+    return _num(value) or 0
+
+
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 def price_state(s: dict) -> str:
-    """Trạng thái giá so với sàn/trần/tham chiếu."""
-    price, basic = s.get("price"), s.get("basic_price")
-    ceil, floor = s.get("ceiling_price"), s.get("floor_price")
-    try:
-        if price is not None and ceil is not None and price >= ceil:
-            return "chạm trần"
-        if price is not None and floor is not None and price <= floor:
-            return "chạm sàn"
-        if price is not None and basic is not None:
-            if price > basic:
-                return "tăng"
-            if price < basic:
-                return "giảm"
-            return "đứng giá"
-    except (TypeError, ValueError):
-        pass
-    return "—"
+    """Price relative to the ceiling / floor / reference price."""
+    price, basic = _num(s.get("price")), _num(s.get("basic_price"))
+    ceiling, floor = _num(s.get("ceiling_price")), _num(s.get("floor_price"))
+    if price is None:
+        return "unknown"
+    if ceiling is not None and price >= ceiling:
+        return "at_ceiling"
+    if floor is not None and price <= floor:
+        return "at_floor"
+    if basic is None:
+        return "unknown"
+    return "up" if price > basic else "down" if price < basic else "unchanged"
 
 
 def _fmt_quote(s: dict, rank: int | None = None) -> dict:
     out = {
-        "symbol": s.get("symbol"),
-        "price": s.get("price"),
-        "change": s.get("change"),
-        "change_percent": s.get("change_percent"),
+        "symbol": _text(s.get("symbol")) or None,
+        "price": _num(s.get("price")),
+        "change": _num(s.get("change")),
+        "change_percent": _num(s.get("change_percent")),
         "state": price_state(s),
-        "reference_price": s.get("basic_price"),
-        "ceiling_price": s.get("ceiling_price"),
-        "floor_price": s.get("floor_price"),
-        # field API ghi nhầm "accumylated_vol" — giữ nguyên khi đọc
-        "matched_volume": s.get("accumylated_vol"),
-        "matched_value_bn_vnd": s.get("accumulated_val"),  # tỷ VND
-        "foreign_buy_volume": s.get("buy_foreign_qtty"),
-        "foreign_sell_volume": s.get("sell_foreign_qtty"),
+        "reference_price": _num(s.get("basic_price")),
+        "ceiling_price": _num(s.get("ceiling_price")),
+        "floor_price": _num(s.get("floor_price")),
+        # the upstream field name is misspelled "accumylated_vol" - keep it when reading
+        "matched_volume": _num(s.get("accumylated_vol")),
+        "matched_value_bn_vnd": _num(s.get("accumulated_val")),
+        "foreign_buy_volume": _num(s.get("buy_foreign_qtty")),
+        "foreign_sell_volume": _num(s.get("sell_foreign_qtty")),
     }
-    if rank is not None:
-        out = {"rank": rank, **out}
-    return out
+    return {"rank": rank, **out} if rank is not None else out
 
 
-def _epoch_to_vn(ts) -> datetime | None:
-    if not isinstance(ts, (int, float)) or ts <= 0:
+def _epoch_to_vn(ts: Any) -> datetime | None:
+    ts = _num(ts)
+    if ts is None or ts <= 0:
         return None
-    ts_sec = ts / 1000 if ts > 1e12 else float(ts)  # API trả epoch giây; phòng hờ ms
-    return datetime.fromtimestamp(ts_sec, tz=timezone.utc).astimezone(TZ_VN)
+    ts_sec = ts / 1000 if ts > 1e12 else float(ts)  # the API sends epoch seconds; tolerate milliseconds
+    return datetime.fromtimestamp(ts_sec, tz=UTC).astimezone(TZ_VN)
 
 
-def _vn_date(ts) -> str | None:
+def _vn_date(ts: Any) -> str | None:
     d = _epoch_to_vn(ts)
     return d.strftime("%Y-%m-%d") if d else None
 
 
 def _market_meta(data: dict) -> dict:
-    meta: dict = {"source": "24hmoney.vn", "stocks_tracked": len(data.get("stocks") or []),
-                  "units": "giá: nghìn VND · giá trị: tỷ VND"}
+    meta: dict = {"stocks_tracked": len(data["stocks"])}
     ts = _epoch_to_vn(data.get("last_update"))
     if ts:
-        meta["last_update"] = ts.strftime("%Y-%m-%d %H:%M:%S (GMT+7)")
+        meta["last_update"] = ts.isoformat(timespec="seconds")
         age = time.time() - ts.timestamp()
         if age > STALE_AFTER:
             meta["note"] = (
-                f"dữ liệu cập nhật lần cuối {int(age // 60)} phút trước — thị trường "
-                "có thể đã đóng cửa hoặc API ngừng cập nhật"
+                f"Data was last updated {int(age // 60)} minutes ago - the market may be closed "
+                "or the upstream feed may have stopped updating."
             )
     return meta
 
 
 SORTS = {
-    "default": None,                                   # thứ tự API (top recommend)
-    "change_percent": lambda s: s.get("change_percent") or 0.0,
-    "value": lambda s: s.get("accumulated_val") or 0.0,
-    "volume": lambda s: s.get("accumylated_vol") or 0.0,
-    "foreign_net_buy": lambda s: (s.get("buy_foreign_qtty") or 0) - (s.get("sell_foreign_qtty") or 0),
+    "default": None,  # upstream order (24hMoney recommendation)
+    "change_percent": lambda s: _zero(s.get("change_percent")),
+    "value": lambda s: _zero(s.get("accumulated_val")),
+    "volume": lambda s: _zero(s.get("accumylated_vol")),
+    "foreign_net_buy": lambda s: _zero(s.get("buy_foreign_qtty")) - _zero(s.get("sell_foreign_qtty")),
 }
 
 
-def _clamp(value, default: int, hi: int) -> int:
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return default
+def _clamp(value: int, hi: int) -> int:
+    """Limit a count to 1..hi. Tool arguments are validated as integers before they reach the tools."""
     return max(1, min(hi, value))
 
 
-def _clamp_limit(limit) -> int:
-    return _clamp(limit, 10, MAX_LIMIT)
-
-
-def _norm_symbol(symbol) -> str | None:
-    sym = (symbol or "").strip().upper()
+def _norm_symbol(symbol: str) -> str | None:
+    sym = symbol.strip().upper()
     return sym if SYMBOL_RE.match(sym) else None
 
 
+def _require_symbol(symbol: str) -> str:
+    sym = _norm_symbol(symbol)
+    if not sym:
+        raise ToolError(f"Invalid stock symbol: '{symbol}'. Valid examples: FPT, VCB, HPG. "
+                        "Use search_company if you do not know the ticker.")
+    return sym
+
+
 def _fold(text: str) -> str:
-    """Bỏ dấu tiếng Việt + lowercase để tìm kiếm ('Hòa Phát' ~ 'hoa phat')."""
-    text = (text or "").replace("đ", "d").replace("Đ", "D")
+    """Strip Vietnamese diacritics and lowercase, so 'Hòa Phát' matches 'hoa phat'."""
+    text = text.replace("đ", "d").replace("Đ", "D")
     text = unicodedata.normalize("NFD", text)
     return "".join(c for c in text if unicodedata.category(c) != "Mn").lower()
+
+
+def _newest_first(rows: list[dict], field: str = "trading_date") -> list[dict]:
+    return sorted(rows, key=lambda r: _zero(r.get(field)), reverse=True)
+
+
+# Units, keyed by the kind of number a field holds; every result carries the ones it uses.
+UNITS_MARKET = {"price": "thousand VND", "value": "billion VND", "volume": "shares"}
+
+
+def _result(payload: dict, units: dict | None = None) -> dict:
+    """Common envelope: `units` (when the result has numbers) and `source` sit at the top level of every tool result."""
+    return {**payload, **({"units": units} if units else {}), "source": SOURCE}
 
 
 # ────────────────────────────── MCP tools ──────────────────────────────
 
 mcp = FastMCP("vn-stock", stateless_http=True, json_response=True, host="0.0.0.0")
 
+# Every tool only reads data (readOnlyHint) from an external service (openWorldHint).
+READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
-def _ok(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def _err(msg: str) -> str:
-    return json.dumps({"error": msg}, ensure_ascii=False)
+Symbol = Annotated[str, Field(description="Stock ticker, 2-10 letters or digits, case-insensitive (e.g. FPT, VCB, HPG).")]
+Limit = Annotated[int, Field(description=f"Maximum number of results, 1-{MAX_LIMIT}; larger values are clamped.")]
 
 
-def _bad_symbol(symbol) -> str:
-    return _err(f"Mã cổ phiếu không hợp lệ: '{symbol}'. Ví dụ hợp lệ: FPT, VCB, HPG. "
-                "Dùng search_company nếu chưa biết mã.")
-
-
-async def _ranked(limit, key, keep=lambda s: True, reverse=True) -> str:
-    try:
-        data = await fetch_top_stocks()
-    except RuntimeError as e:
-        return _err(str(e))
-    stocks = [s for s in data.get("stocks") or [] if keep(s)]
+async def _ranked(limit: int, key=None, keep=None, reverse: bool = True) -> dict:
+    data = await fetch_top_stocks()
+    stocks = [s for s in data["stocks"] if keep is None or keep(s)]
     if key:
         stocks.sort(key=key, reverse=reverse)
-    top = stocks[:_clamp_limit(limit)]
-    return _ok({
-        "meta": _market_meta(data),
+    top = stocks[:_clamp(limit, MAX_LIMIT)]
+    return _result({
+        **_market_meta(data),
         "count": len(top),
         "stocks": [_fmt_quote(s, rank=i + 1) for i, s in enumerate(top)],
-    })
+    }, UNITS_MARKET)
 
 
-@mcp.tool()
-async def market_top_stocks(limit: int = 20, sort: str = "default") -> str:
-    """Bảng top cổ phiếu Việt Nam (nguồn 24hMoney) — ~90 mã thanh khoản cao nhất.
+@mcp.tool(annotations=READ_ONLY)
+async def market_top_stocks(
+    limit: Limit = 20,
+    sort: Annotated[str, Field(description=(
+        "'default' (24hMoney recommendation order), 'change_percent' (+/- %), 'value' (traded value), "
+        "'volume' (traded volume) or 'foreign_net_buy' (foreign net buy volume)."))] = "default",
+) -> dict[str, Any]:
+    """Vietnamese market table: the ~90 most liquid stocks (source: 24hMoney), sorted as requested.
 
-    sort: 'default' (thứ tự khuyến nghị của 24hMoney) | 'change_percent' (+/-%)
-          | 'value' (giá trị GD, tỷ VND) | 'volume' (khối lượng GD)
-          | 'foreign_net_buy' (ngoại mua ròng).
-    limit: 1–30 (mặc định 20). Ví dụ: market_top_stocks(limit=15, sort='value').
+    Example: market_top_stocks(limit=15, sort='value').
     """
     if sort not in SORTS:
-        return _err(f"sort không hợp lệ ({sort}). Chọn: " + ", ".join(SORTS))
+        raise ToolError(f"Invalid sort '{sort}'. Choose one of: " + ", ".join(SORTS))
     return await _ranked(limit, SORTS[sort])
 
 
-@mcp.tool()
-async def top_gainers(limit: int = 10) -> str:
-    """Top cổ phiếu TĂNG mạnh nhất hôm nay (theo % tăng, chỉ mã đang tăng).
+@mcp.tool(annotations=READ_ONLY)
+async def top_gainers(limit: Limit = 10) -> dict[str, Any]:
+    """Stocks with the largest gains today (by % change; only stocks that are up).
 
-    limit: 1–30 (mặc định 10). Ví dụ: top_gainers(limit=5).
+    Example: top_gainers(limit=5).
     """
-    return await _ranked(limit, lambda s: s.get("change_percent") or 0.0,
-                         keep=lambda s: (s.get("change_percent") or 0) > 0)
+    return await _ranked(limit, lambda s: _zero(s.get("change_percent")),
+                         keep=lambda s: _zero(s.get("change_percent")) > 0)
 
 
-@mcp.tool()
-async def top_losers(limit: int = 10) -> str:
-    """Top cổ phiếu GIẢM sâu nhất hôm nay (theo % giảm, chỉ mã đang giảm).
+@mcp.tool(annotations=READ_ONLY)
+async def top_losers(limit: Limit = 10) -> dict[str, Any]:
+    """Stocks with the deepest losses today (by % change; only stocks that are down).
 
-    limit: 1–30 (mặc định 10). Ví dụ: top_losers(limit=5).
+    Example: top_losers(limit=5).
     """
-    return await _ranked(limit, lambda s: s.get("change_percent") or 0.0,
-                         keep=lambda s: (s.get("change_percent") or 0) < 0, reverse=False)
+    return await _ranked(limit, lambda s: _zero(s.get("change_percent")),
+                         keep=lambda s: _zero(s.get("change_percent")) < 0, reverse=False)
 
 
-@mcp.tool()
-async def most_active(limit: int = 10) -> str:
-    """Top cổ phiếu THANH KHOẢN lớn nhất (theo giá trị giao dịch, tỷ VND).
+@mcp.tool(annotations=READ_ONLY)
+async def most_active(limit: Limit = 10) -> dict[str, Any]:
+    """Most liquid stocks today (by traded value, billion VND).
 
-    limit: 1–30 (mặc định 10). Ví dụ: most_active(limit=15).
+    Example: most_active(limit=15).
     """
-    return await _ranked(limit, lambda s: s.get("accumulated_val") or 0.0)
+    return await _ranked(limit, lambda s: _zero(s.get("accumulated_val")))
 
 
-@mcp.tool()
-async def stock_quote(symbol: str) -> str:
-    """Báo giá 1 mã trong nhóm top (~90 mã thanh khoản cao): giá, +/-%, trần/sàn,
-    khối lượng & giá trị khớp lệnh, khối lượng ngoại mua/bán.
+@mcp.tool(annotations=READ_ONLY)
+async def stock_quote(symbol: Symbol) -> dict[str, Any]:
+    """Quote for one stock in the top group (~90 most liquid): price, +/- %, ceiling / floor,
+    matched volume and value, foreign buy / sell volume.
 
-    Mã ngoài nhóm top: dùng price_history(symbol, days=1).
-    Ví dụ: stock_quote(symbol='VIC') hoặc stock_quote(symbol='vic').
+    For a stock outside the top group use price_history(symbol, days=1).
+    Example: stock_quote(symbol='VIC') or stock_quote(symbol='vic').
     """
-    try:
-        data = await fetch_top_stocks()
-    except RuntimeError as e:
-        return _err(str(e))
-    sym = (symbol or "").strip().upper()
-    for s in data.get("stocks") or []:
-        if (s.get("symbol") or "").upper() == sym:
-            return _ok({"meta": _market_meta(data), "quote": _fmt_quote(s)})
-    return _err(
-        f"Không tìm thấy mã '{symbol}' trong nhóm top (~{len(data.get('stocks') or [])} mã "
-        "thanh khoản cao nhất). Dùng market_top_stocks để xem danh sách, hoặc "
-        "price_history(symbol) cho mã bất kỳ."
+    sym = _require_symbol(symbol)
+    data = await fetch_top_stocks()
+    for s in data["stocks"]:
+        if _text(s.get("symbol")).upper() == sym:
+            return _result({**_market_meta(data), "quote": _fmt_quote(s)}, UNITS_MARKET)
+    raise ToolError(
+        f"Symbol '{sym}' is not in the top group (~{len(data['stocks'])} most liquid stocks). "
+        "Use market_top_stocks to list it, or price_history(symbol) for any listed stock."
     )
 
 
-@mcp.tool()
-async def search_company(query: str, limit: int = 10) -> str:
-    """Tìm mã cổ phiếu theo tên công ty hoặc mã (không phân biệt dấu, hoa/thường).
+@mcp.tool(annotations=READ_ONLY)
+async def search_company(
+    query: Annotated[str, Field(description="Company name or ticker, at least 2 characters; "
+                                            "case and Vietnamese diacritics are ignored.")],
+    limit: Limit = 10,
+) -> dict[str, Any]:
+    """Find a stock ticker by company name or ticker.
 
-    Phủ ~1.6k doanh nghiệp niêm yết trên HOSE, HNX, UPCOM.
-    Ví dụ: search_company('hoa phat'), search_company('ngân hàng ngoại thương'), search_company('FPT').
+    Covers ~1.6k companies listed on HOSE, HNX and UPCOM.
+    Examples: search_company('hoa phat'), search_company('FPT').
     """
     q = _fold(query).strip()
     if len(q) < 2:
-        return _err("query cần ít nhất 2 ký tự")
-    try:
-        companies = await fetch_companies()
-    except RuntimeError as e:
-        return _err(str(e))
+        raise ToolError("query needs at least 2 characters")
     scored = []
-    for c in companies:
-        sym = (c.get("symbol") or "").lower()
-        names = _fold(" ".join(filter(None, [c.get("company_name"), c.get("short_name"),
-                                             c.get("company_name_eng"), c.get("extra_name")])))
+    for c in await fetch_companies():
+        sym = _text(c.get("symbol")).lower()
+        names = _fold(" ".join(_text(c.get(f)) for f in
+                               ("company_name", "short_name", "company_name_eng", "extra_name")))
         if sym == q:
             score = 0
         elif sym.startswith(q):
@@ -419,306 +583,300 @@ async def search_company(query: str, limit: int = 10) -> str:
             score = 2
         else:
             continue
-        exch = {"HOSE": 0, "HNX": 1, "UPCOM": 2}.get(c.get("floor"), 3)
-        # priority=1: ~72 doanh nghiệp lớn / quen thuộc → xếp trước (HPG trước HPA khi tìm 'hoa phat')
+        exch = {"HOSE": 0, "HNX": 1, "UPCOM": 2}.get(_text(c.get("floor")), 3)
+        # priority=1 marks ~72 large / well-known companies: rank them first (HPG before HPA for 'hoa phat')
         prio = 1 if c.get("priority") in (1, "1", True) else 0
         scored.append((score, -prio, exch, sym, c))
     scored.sort(key=lambda t: t[:4])
-    top = scored[:_clamp_limit(limit)]
-    return _ok({
+    top = scored[:_clamp(limit, MAX_LIMIT)]
+    return _result({
         "query": query,
         "count": len(top),
-        "results": [{"symbol": c.get("symbol"), "company_name": c.get("company_name"),
-                     "exchange": c.get("floor")} for *_, c in top],
+        "results": [{"symbol": _text(c.get("symbol")) or None,
+                     "company_name": _text(c.get("company_name")) or None,
+                     "exchange": _text(c.get("floor")) or None} for *_, c in top],
     })
 
 
-@mcp.tool()
-async def company_profile(symbol: str) -> str:
-    """Hồ sơ doanh nghiệp: tên đầy đủ (VN/EN), sàn niêm yết, mô tả hoạt động.
+@mcp.tool(annotations=READ_ONLY)
+async def company_profile(symbol: Symbol) -> dict[str, Any]:
+    """Company profile: full name (Vietnamese / English), listing exchange, business description.
 
-    Ví dụ: company_profile(symbol='HPG').
+    Example: company_profile(symbol='HPG').
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    try:
-        companies = await fetch_companies()
-    except RuntimeError as e:
-        return _err(str(e))
-    for c in companies:
-        if (c.get("symbol") or "").upper() == sym:
-            desc = (c.get("description") or "").strip()
-            return _ok({
+    sym = _require_symbol(symbol)
+    for c in await fetch_companies():
+        if _text(c.get("symbol")).upper() == sym:
+            desc = _text(c.get("description"))
+            return _result({
                 "symbol": sym,
-                "company_name": c.get("company_name"),
-                "company_name_eng": c.get("company_name_eng"),
-                "short_name": c.get("short_name"),
-                "exchange": c.get("floor"),
+                "company_name": _text(c.get("company_name")) or None,
+                "company_name_eng": _text(c.get("company_name_eng")) or None,
+                "short_name": _text(c.get("short_name")) or None,
+                "exchange": _text(c.get("floor")) or None,
                 "description": desc[:1200] + ("…" if len(desc) > 1200 else ""),
-                "source": "24hmoney.vn",
             })
-    return _err(f"Không tìm thấy doanh nghiệp có mã '{sym}'. Thử search_company.")
+    raise ToolError(f"No company found with symbol '{sym}'. Try search_company.")
 
 
-@mcp.tool()
-async def price_history(symbol: str, days: int = 10) -> str:
-    """Lịch sử giá theo phiên (mới nhất trước): giá đóng cửa, tham chiếu, +/-%,
-    khối lượng & giá trị khớp lệnh. Có tóm tắt cả kỳ (tăng/giảm %, cao nhất, thấp nhất).
+@mcp.tool(annotations=READ_ONLY)
+async def price_history(
+    symbol: Symbol,
+    days: Annotated[int, Field(description=f"Number of trading sessions, 1-{MAX_HISTORY_DAYS}; "
+                                           "larger values are clamped.")] = 10,
+) -> dict[str, Any]:
+    """Price history per trading session, newest first: close, reference price, +/- %, matched volume and value.
 
-    days: 1–30 phiên (mặc định 10). Ví dụ: price_history(symbol='FPT', days=20).
+    The summary covers the returned sessions: first and last date, highest and lowest CLOSE, and the
+    % change from the oldest session's reference price to the latest close.
+    Example: price_history(symbol='FPT', days=20).
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    try:
-        rows = await fetch_api(TRADING_HISTORY_PATH, {"symbol": sym},
-                               cache_key=f"history:{sym}", ttl=CACHE_TTL)
-    except RuntimeError as e:
-        return _err(str(e))
-    rows = sorted([r for r in rows or [] if isinstance(r, dict)],
-                  key=lambda r: r.get("trading_date") or 0, reverse=True)
+    sym = _require_symbol(symbol)
+    rows = await fetch_api(TRADING_HISTORY_PATH, {"symbol": sym}, cache_key=f"history:{sym}",
+                           ttl=CACHE_TTL, parse=_parse_rows)
     if not rows:
-        return _err(f"Không có lịch sử giá cho mã '{sym}'.")
-    rows = rows[:_clamp(days, 10, 30)]
-    out = []
+        raise ToolError(f"No price history for '{sym}'.")
+    rows = _newest_first(rows)[:_clamp(days, MAX_HISTORY_DAYS)]
+    sessions = []
     for r in rows:
-        close, ref = r.get("match_price"), r.get("basic_price")
+        close, ref = _num(r.get("match_price")), _num(r.get("basic_price"))
         chg = round(close - ref, 2) if close is not None and ref else None
-        out.append({
+        sessions.append({
             "date": _vn_date(r.get("trading_date")),
             "close": close,
             "reference": ref,
             "change": chg,
             "change_percent": round(chg / ref * 100, 2) if chg is not None else None,
-            "volume": r.get("accumulated_vol"),
-            "value_bn_vnd": r.get("accumulated_val"),
+            "volume": _num(r.get("accumulated_vol")),
+            "value_bn_vnd": _num(r.get("accumulated_val")),
         })
-    closes = [r["close"] for r in out if r["close"] is not None]
-    first_ref = rows[-1].get("basic_price")
-    summary = {
-        "sessions": len(out),
-        "from": out[-1]["date"], "to": out[0]["date"],
-        "high": max(closes) if closes else None,
-        "low": min(closes) if closes else None,
-        "period_change_percent": (round((closes[0] - first_ref) / first_ref * 100, 2)
-                                  if closes and first_ref else None),
-    }
-    return _ok({"symbol": sym, "units": "giá: nghìn VND · giá trị: tỷ VND",
-                "summary": summary, "sessions": out})
+    closes = [s["close"] for s in sessions if s["close"] is not None]
+    first_ref = _num(rows[-1].get("basic_price"))
+    return _result({
+        "symbol": sym,
+        "count": len(sessions),
+        "summary": {
+            "from": sessions[-1]["date"],
+            "to": sessions[0]["date"],
+            "highest_close": max(closes) if closes else None,
+            "lowest_close": min(closes) if closes else None,
+            "period_change_percent": (round((closes[0] - first_ref) / first_ref * 100, 2)
+                                      if closes and first_ref else None),
+        },
+        "sessions": sessions,
+    }, UNITS_MARKET)
 
 
-@mcp.tool()
-async def foreign_trading(symbol: str, days: int = 10) -> str:
-    """Giao dịch khối ngoại theo phiên: khối lượng & giá trị mua/bán, mua ròng.
+@mcp.tool(annotations=READ_ONLY)
+async def foreign_trading(
+    symbol: Symbol,
+    days: Annotated[int, Field(description=f"Number of trading sessions, 1-{MAX_FOREIGN_DAYS}; "
+                                           "larger values are clamped.")] = 10,
+) -> dict[str, Any]:
+    """Foreign investor trading per session, newest first: buy / sell volume and value, net value.
 
-    days: 1–25 phiên (mặc định 10). Ví dụ: foreign_trading(symbol='VNM', days=5).
+    Values the upstream does not report stay null; they are never counted as 0 in the net figures.
+    Example: foreign_trading(symbol='VNM', days=5).
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    try:
-        rows = await fetch_api(FOREIGN_HISTORY_PATH, {"symbol": sym},
-                               cache_key=f"foreign:{sym}", ttl=CACHE_TTL)
-    except RuntimeError as e:
-        return _err(str(e))
-    rows = sorted([r for r in rows or [] if isinstance(r, dict)],
-                  key=lambda r: r.get("trading_date") or 0, reverse=True)
+    sym = _require_symbol(symbol)
+    rows = await fetch_api(FOREIGN_HISTORY_PATH, {"symbol": sym}, cache_key=f"foreign:{sym}",
+                           ttl=CACHE_TTL, parse=_parse_rows)
     if not rows:
-        return _err(f"Không có dữ liệu khối ngoại cho mã '{sym}'.")
-    rows = rows[:_clamp(days, 10, 25)]
-    out = []
+        raise ToolError(f"No foreign trading data for '{sym}'.")
+    rows = _newest_first(rows)[:_clamp(days, MAX_FOREIGN_DAYS)]
+    sessions = []
     for r in rows:
-        bv, sv = r.get("buy_foreign_val") or 0, r.get("sell_foreign_val") or 0
-        out.append({
+        buy, sell = _num(r.get("buy_foreign_val")), _num(r.get("sell_foreign_val"))
+        sessions.append({
             "date": _vn_date(r.get("trading_date")),
-            "close": r.get("match_price"),
-            "buy_volume": r.get("buy_foreign_qtty"),
-            "sell_volume": r.get("sell_foreign_qtty"),
-            "buy_value_bn_vnd": r.get("buy_foreign_val"),
-            "sell_value_bn_vnd": r.get("sell_foreign_val"),
-            "net_value_bn_vnd": round(bv - sv, 3),
+            "close": _num(r.get("match_price")),
+            "buy_volume": _num(r.get("buy_foreign_qtty")),
+            "sell_volume": _num(r.get("sell_foreign_qtty")),
+            "buy_value_bn_vnd": buy,
+            "sell_value_bn_vnd": sell,
+            "net_value_bn_vnd": round(buy - sell, 3) if buy is not None and sell is not None else None,
         })
-    net = round(sum(r["net_value_bn_vnd"] for r in out), 3)
-    return _ok({
+    nets = [s["net_value_bn_vnd"] for s in sessions if s["net_value_bn_vnd"] is not None]
+    net = round(sum(nets), 3) if nets else None
+    return _result({
         "symbol": sym,
-        "units": "giá: nghìn VND · giá trị: tỷ VND",
-        "summary": {"sessions": len(out), "net_value_bn_vnd": net,
-                    "trend": "mua ròng" if net > 0 else "bán ròng" if net < 0 else "cân bằng"},
-        "sessions": out,
-    })
+        "count": len(sessions),
+        "summary": {
+            "sessions_with_net_value": len(nets),
+            "net_value_bn_vnd": net,
+            "trend": None if net is None else "net_buy" if net > 0 else "net_sell" if net < 0 else "balanced",
+        },
+        "sessions": sessions,
+    }, UNITS_MARKET)
 
 
-@mcp.tool()
-async def valuation(symbol: str) -> str:
-    """Chỉ số định giá & hiệu quả: P/E, P/B (so với trung bình ngành), ROE, ROA, EPS,
-    biên lợi nhuận ròng, EV/EBITDA — kèm nhận xét ngắn của 24hMoney.
+VALUATION_METRICS = {  # upstream key -> (label, unit)
+    "pe": ("P/E", "x"),
+    "pb": ("P/B", "x"),
+    "roe": ("ROE", "%"),
+    "roa": ("ROA", "%"),
+    "eps": ("EPS", "VND"),
+    "net_profit_margin": ("Net profit margin", "%"),
+    "ev_per_ebitda": ("EV/EBITDA", "x"),
+}
 
-    Ví dụ: valuation(symbol='FPT').
+
+@mcp.tool(annotations=READ_ONLY)
+async def valuation(symbol: Symbol) -> dict[str, Any]:
+    """Valuation and efficiency metrics: P/E, P/B (vs the industry average), ROE, ROA, EPS,
+    net profit margin, EV/EBITDA - with a short comment from 24hMoney.
+
+    Example: valuation(symbol='FPT').
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    try:
-        data = await fetch_api(VALUATION_PATH, {"symbol": sym},
-                               cache_key=f"valuation:{sym}", ttl=SLOW_TTL)
-    except RuntimeError as e:
-        return _err(str(e))
-    if not isinstance(data, dict) or not data:
-        return _err(f"Không có dữ liệu định giá cho mã '{sym}'.")
-    labels = {"pe": "P/E", "pb": "P/B", "roe": "ROE (%)", "roa": "ROA (%)", "eps": "EPS (VND)",
-              "net_profit_margin": "Biên LN ròng (%)", "ev_per_ebitda": "EV/EBITDA"}
+    sym = _require_symbol(symbol)
+    data = await fetch_api(VALUATION_PATH, {"symbol": sym}, cache_key=f"valuation:{sym}",
+                           ttl=SLOW_TTL, parse=_parse_object)
     metrics = {}
-    for k, label in labels.items():
-        v = data.get(k)
-        if isinstance(v, dict) and v.get("value") is not None:
-            item = {"label": label, "value": round(v["value"], 2)}
-            if v.get("group_value") is not None:
-                item["industry_avg"] = v["group_value"]
-            if v.get("message"):
-                item["note"] = v["message"]
-            metrics[k] = item
-    return _ok({"symbol": sym, "industry": data.get("group_name"),
-                "metrics": metrics, "source": "24hmoney.vn"})
+    for key, (label, _unit) in VALUATION_METRICS.items():
+        v = data.get(key)
+        value = _num(v.get("value")) if isinstance(v, dict) else None
+        if value is None:
+            continue
+        item = {"label": label, "value": round(value, 2)}
+        industry_avg = _num(v.get("group_value"))
+        if industry_avg is not None:
+            item["industry_avg"] = round(industry_avg, 2)
+        if _text(v.get("message")):
+            item["note"] = _text(v["message"])
+        metrics[key] = item
+    if not metrics:
+        raise ToolError(f"No valuation data for '{sym}'.")
+    return _result({"symbol": sym, "industry": _text(data.get("group_name")) or None, "metrics": metrics},
+                   {key: unit for key, (_label, unit) in VALUATION_METRICS.items()})
 
 
-DIVIDEND_TYPES = {1: "tiền mặt", 2: "cổ phiếu", 3: "cổ phiếu thưởng / phát hành tăng vốn"}
+DIVIDEND_TYPES = {1: "cash", 2: "stock", 3: "bonus_shares"}  # 3 = bonus shares / capital-raising issue
+PAR_VALUE_VND = 10_000
 
 
-@mcp.tool()
-async def dividend_history(symbol: str, limit: int = 10) -> str:
-    """Lịch sử chia cổ tức (mới nhất trước): ngày, hình thức, tỷ lệ.
+@mcp.tool(annotations=READ_ONLY)
+async def dividend_history(symbol: Symbol, limit: Limit = 10) -> dict[str, Any]:
+    """Dividend history, newest first: date, type (cash / stock / bonus_shares) and ratio.
 
-    Tỷ lệ tính trên mệnh giá 10.000 VND (vd 10% tiền mặt = 1.000 VND/cp).
-    limit: 1–30 (mặc định 10). Ví dụ: dividend_history(symbol='FPT').
+    The ratio is a percentage of the 10,000 VND par value (10% cash = 1,000 VND per share).
+    Example: dividend_history(symbol='FPT').
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    try:
-        rows = await fetch_api(DIVIDEND_PATH, {"symbol": sym},
-                               cache_key=f"dividend:{sym}", ttl=SLOW_TTL)
-    except RuntimeError as e:
-        return _err(str(e))
-    rows = sorted([r for r in rows or [] if isinstance(r, dict)],
-                  key=lambda r: r.get("end_date") or "", reverse=True)
+    sym = _require_symbol(symbol)
+    rows = await fetch_api(DIVIDEND_PATH, {"symbol": sym}, cache_key=f"dividend:{sym}",
+                           ttl=SLOW_TTL, parse=_parse_rows)
     if not rows:
-        return _err(f"Không có lịch sử cổ tức cho mã '{sym}'.")
-    out = []
-    for r in rows[:_clamp_limit(limit)]:
-        ratio = r.get("ratio")
-        item = {"date": r.get("end_date"),
-                "type": DIVIDEND_TYPES.get(r.get("type"), f"khác ({r.get('type')})"),
-                "ratio_percent": round(ratio * 100, 2) if isinstance(ratio, (int, float)) else None}
-        if r.get("type") == 1 and isinstance(ratio, (int, float)):
-            item["cash_vnd_per_share"] = round(ratio * 10_000)
-        out.append(item)
-    return _ok({"symbol": sym, "count": len(out), "dividends": out, "source": "24hmoney.vn"})
+        raise ToolError(f"No dividend history for '{sym}'.")
+    rows = sorted(rows, key=lambda r: _text(r.get("end_date")), reverse=True)
+    dividends = []
+    for r in rows[:_clamp(limit, MAX_LIMIT)]:
+        code, ratio = _num(r.get("type")), _num(r.get("ratio"))
+        item = {"date": _text(r.get("end_date")) or None,
+                "type": DIVIDEND_TYPES.get(code, "other"),
+                "ratio_percent": round(ratio * 100, 2) if ratio is not None else None}
+        if code == 1 and ratio is not None:
+            item["cash_vnd_per_share"] = round(ratio * PAR_VALUE_VND)
+        dividends.append(item)
+    return _result({"symbol": sym, "count": len(dividends), "dividends": dividends},
+                   {"ratio_percent": f"% of the {PAR_VALUE_VND:,} VND par value", "cash_vnd_per_share": "VND"})
 
 
-@mcp.tool()
-async def business_plan(symbol: str) -> str:
-    """Kế hoạch kinh doanh năm (doanh thu, lợi nhuận) và % hoàn thành tới quý gần nhất.
+@mcp.tool(annotations=READ_ONLY)
+async def business_plan(symbol: Symbol) -> dict[str, Any]:
+    """Annual business plan (revenue, profit) and % completed up to the latest quarter.
 
-    Đơn vị: tỷ VND. Ví dụ: business_plan(symbol='MWG').
+    Example: business_plan(symbol='MWG').
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    try:
-        data = await fetch_api(PLAN_PATH, {"symbol": sym},
-                               cache_key=f"plan:{sym}", ttl=SLOW_TTL)
-    except RuntimeError as e:
-        return _err(str(e))
-    if not isinstance(data, dict) or not data.get("plan"):
-        return _err(f"Không có kế hoạch kinh doanh cho mã '{sym}'.")
-    return _ok({
+    sym = _require_symbol(symbol)
+    data = await fetch_api(PLAN_PATH, {"symbol": sym}, cache_key=f"plan:{sym}",
+                           ttl=SLOW_TTL, parse=_parse_object)
+    plan = data.get("plan")
+    items = [p for p in plan if isinstance(p, dict)] if isinstance(plan, list) else []
+    if not items:
+        raise ToolError(f"No business plan for '{sym}'.")
+    return _result({
         "symbol": sym,
-        "year": data.get("year"),
-        "through_quarter": data.get("quarter"),
-        "units": "tỷ VND",
-        "plan": [{"item": p.get("label"), "target": p.get("expect"),
-                  "actual": p.get("current"), "completed_percent": p.get("percent")}
-                 for p in data["plan"] if isinstance(p, dict)],
-        "source": "24hmoney.vn",
-    })
+        "year": _num(data.get("year")),
+        "through_quarter": _num(data.get("quarter")),
+        "count": len(items),
+        "plan": [{"item": _text(p.get("label")) or None, "target": _num(p.get("expect")),
+                  "actual": _num(p.get("current")), "completed_percent": _num(p.get("percent"))}
+                 for p in items],
+    }, {"target": "billion VND", "actual": "billion VND", "completed_percent": "%"})
 
 
-@mcp.tool()
-async def company_announcements(symbol: str, limit: int = 5) -> str:
-    """Tin công bố thông tin mới nhất của doanh nghiệp (tiêu đề, ngày, link tài liệu).
+@mcp.tool(annotations=READ_ONLY)
+async def company_announcements(
+    symbol: Symbol,
+    limit: Annotated[int, Field(description=f"Maximum number of announcements, 1-{MAX_ANNOUNCEMENTS}; "
+                                            "larger values are clamped.")] = 5,
+) -> dict[str, Any]:
+    """Latest corporate disclosures of a company, newest first: title, date, document link.
 
-    limit: 1–20 (mặc định 5). Ví dụ: company_announcements(symbol='VCB', limit=10).
+    Example: company_announcements(symbol='VCB', limit=10).
     """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return _bad_symbol(symbol)
-    n = _clamp(limit, 5, 20)
-    try:
-        rows = await fetch_api(ANNOUNCEMENT_PATH, {"symbol": sym, "per_page": 20, "timestamp": 0},
-                               cache_key=f"announce:{sym}", ttl=SLOW_TTL)
-    except RuntimeError as e:
-        return _err(str(e))
-    rows = [r for r in rows or [] if isinstance(r, dict)]
+    sym = _require_symbol(symbol)
+    rows = await fetch_api(ANNOUNCEMENT_PATH, {"symbol": sym, "per_page": MAX_ANNOUNCEMENTS, "timestamp": 0},
+                           cache_key=f"announce:{sym}", ttl=SLOW_TTL, parse=_parse_rows)
     if not rows:
-        return _err(f"Không có tin công bố cho mã '{sym}'.")
-    out = []
-    for r in rows[:n]:
-        links = r.get("link") or []
-        out.append({"date": _vn_date(r.get("published_date")),
-                    "title": r.get("title"),
-                    "url": links[0] if isinstance(links, list) and links else None})
-    return _ok({"symbol": sym, "count": len(out), "announcements": out, "source": "24hmoney.vn"})
+        raise ToolError(f"No announcements for '{sym}'.")
+    announcements = []
+    for r in rows[:_clamp(limit, MAX_ANNOUNCEMENTS)]:
+        links = r.get("link")
+        announcements.append({
+            "date": _vn_date(r.get("published_date")),
+            "title": _text(r.get("title")) or None,
+            "url": links[0] if isinstance(links, list) and links and isinstance(links[0], str) else None,
+        })
+    return _result({"symbol": sym, "count": len(announcements), "announcements": announcements})
 
-
-TOOL_NAMES = ["market_top_stocks", "top_gainers", "top_losers", "most_active", "stock_quote",
-              "search_company", "company_profile", "price_history", "foreign_trading",
-              "valuation", "dividend_history", "business_plan", "company_announcements"]
 
 # ────────────────────────── HTTP app (runtime contract) ──────────────────────────
 
 
-def _auth_mode() -> str:
-    if API_KEYS:
-        return f"api-key ({len(API_KEYS)} key)"
-    return "anonymous (ALLOW_ANONYMOUS — chỉ dùng local)" if ALLOW_ANONYMOUS else "locked (chưa cấu hình MCP_API_KEYS)"
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Liveness only: nothing about configuration, keys or upstream state."""
+    return JSONResponse({"status": "ok", "tools": len(await mcp.list_tools())})
 
 
-async def health(request):
-    return JSONResponse({
-        "status": "ok",
-        "server": "vn-stock-mcp",
-        "tools": len(TOOL_NAMES),
-        "mcp_endpoint": "/mcp",
-        "mcp_auth": _auth_mode(),
-        "cache": _stats,
-    })
-
-
-async def root(request):
+@mcp.custom_route("/", methods=["GET"])
+async def root(request: Request) -> JSONResponse:
     return JSONResponse({
         "server": "vn-stock-mcp",
-        "what": "pure MCP server — no LLM, no memory; stock tools served to agents via MCP Gateway",
+        "what": "pure MCP server - no LLM, no memory; stock tools served to agents via MCP Gateway",
         "mcp_endpoint": "/mcp",
-        "auth": "X-Api-Key: <key>  hoặc  Authorization: Bearer <key>",
-        "tools": TOOL_NAMES,
+        "auth": "X-Api-Key: <key>  or  Authorization: Bearer <key>",
+        "tools": [t.name for t in await mcp.list_tools()],
         "data_source": "24hmoney.vn (unofficial public API)",
     })
 
 
-# streamable_http_app() trả Starlette app (lifespan chạy session manager).
-# MCP streamable HTTP mặc định tại /mcp; append routes phụ trợ vào CHÍNH app này
-# (Mount vào app khác sẽ không chạy lifespan của sub-app).
+# streamable_http_app() returns a Starlette app whose lifespan runs the MCP session manager and whose
+# routes include the custom ones above. It is wrapped, not mounted: a mounted sub-app would not run its lifespan.
 asgi_app = mcp.streamable_http_app()
-asgi_app.router.routes.append(Route("/health", health, methods=["GET"]))
-asgi_app.router.routes.append(Route("/", root, methods=["GET"]))
+# The connector URL is exactly /mcp. Without this, /mcp/ would answer a 307 redirect whose Location
+# is built from the (proxy-hidden) scheme and host.
+asgi_app.router.redirect_slashes = False
+
+_mcp_lifespan = asgi_app.router.lifespan_context
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    try:
+        async with _mcp_lifespan(app):
+            yield
+    finally:
+        await _close_client()
+
+
+asgi_app.router.lifespan_context = _lifespan
 
 
 def _extract_key(headers) -> str:
     h = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers or []}
-    for name in ("x-api-key", "x-stock-api-key"):
-        if h.get(name):
-            return h[name].strip()
+    if h.get("x-api-key"):
+        return h["x-api-key"].strip()
     auth = h.get("authorization", "")
     if auth[:7].lower() == "bearer ":
         return auth[7:].strip()
@@ -729,18 +887,19 @@ def _key_valid(supplied: str) -> bool:
     if not supplied:
         return False
     ok = False
-    for good in API_KEYS:  # duyệt hết key → thời gian không lộ key nào khớp
+    for good in AUTH.keys:  # check every key so timing does not reveal which one matched
         ok |= secrets.compare_digest(supplied.encode(), good.encode())
     return ok
 
 
 class RequireApiKeyMiddleware:
-    """ASGI middleware fail-closed cho /mcp.
+    """Fail-closed ASGI middleware for /mcp.
 
-    - Có MCP_API_KEYS → bắt buộc key hợp lệ (401 nếu thiếu/sai).
-    - Không có key + ALLOW_ANONYMOUS → mở (chỉ cho local dev).
-    - Không có key, không ALLOW_ANONYMOUS → 503, không bao giờ tự mở.
-    - /health và / luôn mở (health-probe của runtime phải 200).
+    - Invalid MCP_API_KEYS (placeholder / too short) -> 503, even with ALLOW_ANONYMOUS.
+    - Valid keys configured -> a valid key is required (401 if missing or wrong).
+    - No key and ALLOW_ANONYMOUS=true -> open (local development only).
+    - No key and no ALLOW_ANONYMOUS -> 503: the server never opens itself up.
+    - /health and / are always open (the runtime health probe must get 200).
     """
 
     def __init__(self, app):
@@ -750,18 +909,19 @@ class RequireApiKeyMiddleware:
     async def _reply(send, status: int, message: str, extra=()):
         await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"), *extra]})
-        await send({"type": "http.response.body",
-                    "body": json.dumps({"error": message}, ensure_ascii=False).encode()})
+        await send({"type": "http.response.body", "body": json.dumps({"error": message}).encode()})
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
-        if scope.get("type") == "http" and (path.rstrip("/") == "/mcp" or path.startswith("/mcp/")):
-            if not API_KEYS:
-                if not ALLOW_ANONYMOUS:
-                    return await self._reply(send, 503, "MCP server chưa cấu hình MCP_API_KEYS (fail-closed)")
+        if scope.get("type") == "http" and (path == "/mcp" or path.startswith("/mcp/")):
+            if AUTH.problems:
+                return await self._reply(send, 503, "MCP server API key configuration is invalid (see the server log)")
+            if not AUTH.keys:
+                if not AUTH.allow_anonymous:
+                    return await self._reply(send, 503, "MCP server has no MCP_API_KEYS configured (fail-closed)")
             elif not _key_valid(_extract_key(scope.get("headers"))):
                 client = (scope.get("client") or ("?",))[0]
-                log.warning("401 /mcp từ %s — thiếu hoặc sai API key", client)
+                log.warning("401 /mcp from %s - missing or invalid API key", client)
                 return await self._reply(send, 401, "missing or invalid API key (X-Api-Key / Bearer)",
                                          [(b"www-authenticate", b'Bearer realm="vn-stock-mcp"')])
         await self.app(scope, receive, send)
@@ -773,5 +933,6 @@ app = RequireApiKeyMiddleware(asgi_app)
 if __name__ == "__main__":
     import uvicorn
 
-    log.info("vn-stock-mcp · %d tools · auth: %s", len(TOOL_NAMES), _auth_mode())
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    host, port = os.environ.get("HOST", "0.0.0.0"), int(os.environ.get("PORT", "8080"))
+    log.info("vn-stock-mcp listening on %s:%d - auth: %s", host, port, _describe_auth())
+    uvicorn.run(app, host=host, port=port)
