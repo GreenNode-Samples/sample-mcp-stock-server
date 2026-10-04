@@ -307,8 +307,8 @@ No agent code changes are needed: the agent only sees the `stock__...` tools thr
 ## Deploy in three places
 
 The **same image** (the Dockerfile at the repo root) can be deployed in three places, matching the three scenarios customers most often ask about.
-Agent Runtime and MCP Gateway run in the GreenNode-managed **AgentBase VPC (`172.30.0.0/16`)**, not in the
-customer's VPC. The **gateway's network mode** therefore determines where it can reach the MCP server.
+Agent Runtime and MCP Gateway never run in the customer's VPC: in Public mode they use AgentBase's shared public
+endpoint, and in Private mode they run in the GreenNode-managed **AgentBase VPC (`172.30.0.0/16`)**. The **gateway's network mode** therefore determines where it can reach the MCP server.
 
 | | (a) Agent Runtime | (b) vServer / VKS in the customer's VPC | (c) On-prem (data center) |
 |---|---|---|---|
@@ -367,8 +367,9 @@ and the fail-closed auth middleware (503 / 401 / 3 header styles / 2-key rotatio
 - Skill `agentbase-identity` — Access Control: storing the API key provider
 - Skill `agentbase-gateway` — MCP Connector, inbound/outbound auth, attaching a Policy Group
 - Skill `agentbase-policy` — writing `stock__<tool>` policies
-- Two sample agents that share the same infrastructure: `sample-travel-buddy`,
-  `sample-zalo-restaurant`
+- Related samples: `sample-travel-buddy` (an agent that calls tools through a Public gateway, like the
+  `stock` connector here) and `sample-zalo-restaurant` (a Private runtime with its own Private gateway and an MCP
+  server in the customer VPC)
 
 ## License
 
