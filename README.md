@@ -13,9 +13,20 @@
 
 ## Architecture
 
-![mcp-stock-server architecture](docs/architecture.svg)
+![mcp-stock-server deployment architecture](docs/architecture.svg)
 
-An agent calls a tool through **MCP Gateway** → Policy Group → the `stock` connector attaches an **API key** retrieved from **Access Control** → the server validates the key (fail-closed) → it calls the 24hMoney API. The same image runs on Agent Runtime, on vServer / VKS in the customer's VPC, or on-premises. See [Deploy in three places](#deploy-in-three-places).
+The same image runs in three places, and only the gateway's network mode and the connector URL change:
+
+- **(a) Agent Runtime on AgentBase**: a **Public** MCP Gateway calls the runtime's public endpoint, which is protected by
+  the fail-closed API key and the runtime's IP Access Control.
+- **(b) vServer / VKS in your VPC**: a **Private** gateway reaches the server's private IP over the private connection
+  between the AgentBase VPC (`172.30.0.0/16`) and your VPC.
+- **(c) On-premises**: a **Private** gateway with **Route CIDRs** for the on-premises range goes through your VPC and
+  VPN Site-to-Site / Interconnect to the data center.
+
+In every case the server calls the public 24hMoney API, so (b) and (c) need outbound HTTPS through NAT or a proxy
+(or an internal mirror set in `STOCK_API_BASE_URL`). The call flow inside the gateway is shown in
+[End-to-end flow](#end-to-end-flow); the per-option settings are in [Deploy in three places](#deploy-in-three-places).
 
 ## Why does this repo exist?
 
@@ -294,6 +305,8 @@ Do not mix `"*"` with a list of specific actions — choose one or the other.
 
 ### End-to-end flow
 
+![mcp-stock-server call flow](docs/call-flow.svg)
+
 ```
 Agent → MCP Gateway (Inbound Auth: IAM/JWT)
       → Policy Group (is stock__<tool> allowed?)
@@ -324,6 +337,9 @@ Notes:
 - **The gateway's Network mode is chosen at creation time (step ⑤ Network & Compute) and cannot be changed afterward.** A **Private**
   gateway keeps traffic on the private network, so an MCP server reachable only over the Internet (as in (a)) requires a separate **Public** gateway.
 - A Private gateway lists only VPCs that are **already privately connected to AgentBase**; if yours is not listed, contact GreenNode support to enable it.
+- The server always calls the public 24hMoney API: on vServer / VKS allow outbound HTTPS through NAT or a proxy, on-premises
+  through the data center's proxy / NAT, or point `STOCK_API_BASE_URL` at an internal mirror. See the diagram in
+  [Architecture](#architecture).
 - Wherever the server runs, **the Policy Group still uses the same `stock__<tool>` actions** (e.g. `stock__search_company`).
   Only the connector's Endpoint changes; there is no need to rewrite policies or agent code.
 - On the on-prem side, confirm with GreenNode whether the request source is NATed (it may no longer be `172.30.0.0/16`) before opening the firewall.
